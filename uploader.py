@@ -19,7 +19,7 @@ import logging
 import math
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -41,11 +41,10 @@ StatusDict = dict[str, Any]
 # ------------------------------------------------------------------------------
 
 
-def configure_logging(level: str = "INFO") -> None:
+def configure_logging(level: str = "DEBUG") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper()),
-        format="%(asctime)s.%(msecs)03d - %(levelname)s - "
-        "[%(pathname)s:%(lineno)d - %(funcName)s()] - %(message)s",
+        format="%(asctime)s.%(msecs)03d | %(levelname)s | %(lineno)d | %(funcName)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -118,17 +117,19 @@ def upload_small_file(
     dry_run: bool,
 ) -> None:
     size = path.stat().st_size
-    if dry_run:
-        logging.info(f"DRY-RUN single-part upload {key} ({size} bytes)")
-        return
 
-    logging.debug(f"Uploading small file {key}")
-    s3_client.upload_file(
-        Filename=str(path),
-        Bucket=bucket,
-        Key=key,
-        ExtraArgs={"ACL": "private"},
-    )
+    if dry_run:
+        # simulate network latency: none, but walk the same state changes
+        logging.debug(f"DRY-RUN simulate small upload for {key}")
+    else:
+        logging.debug(f"Uploading small file {key}")
+        s3_client.upload_file(
+            Filename=str(path),
+            Bucket=bucket,
+            Key=key,
+            ExtraArgs={"ACL": "private"},
+        )
+
     status[key]["status"] = "completed"
     status[key]["uploaded_bytes"] = size
     progress.update(size)
@@ -151,24 +152,24 @@ def upload_large_file(
     uploaded_parts: dict[int, str] = entry.get("parts", {})
     uploaded_bytes = entry.get("uploaded_bytes", 0)
 
-    if dry_run:
-        pending = part_count - len(uploaded_parts)
-        logging.info(
-            f'DRY-RUN multipart upload "{key}", {pending}/{part_count} parts pending'
-        )
-        return
-
+    # Create or reuse an upload ID
     if entry.get("upload_id") is None:
-        logging.debug(f"Initiating multipart upload for {key}")
-        upload_id = s3_client.create_multipart_upload(Bucket=bucket, Key=key)[
-            "UploadId"
-        ]
+        if dry_run:
+            upload_id = f"dry-run-{int(time.time())}"
+            logging.debug(f"DRY-RUN create fake multipart upload {key} id={upload_id}")
+        else:
+            logging.debug(f"Initiating multipart upload for {key}")
+            upload_id = s3_client.create_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+            )["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
         save_status_file(status, Path(STATUS_FILE_NAME))
 
     upload_id = entry["upload_id"]
 
+    # Loop over every missing part
     for part_number in range(1, part_count + 1):
         if str(part_number) in uploaded_parts:
             continue
@@ -177,19 +178,23 @@ def upload_large_file(
         bytes_left = size - offset
         part_size = min(MULTIPART_PART_SIZE, bytes_left)
 
-        with path.open("rb") as f:
-            f.seek(offset)
-            data = f.read(part_size)
+        if dry_run:
+            logging.debug(f"DRY-RUN upload part {part_number}/{part_count} for {key}")
+            time.sleep(0)  # simulate negligible latency
+            etag = f"dry-run-etag-{part_number}"
+        else:
+            logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
+            with path.open("rb") as f:
+                f.seek(offset)
+                data = f.read(part_size)
+            etag = s3_client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=data,
+            )["ETag"]
 
-        logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
-        response = s3_client.upload_part(
-            Bucket=bucket,
-            Key=key,
-            PartNumber=part_number,
-            UploadId=upload_id,
-            Body=data,
-        )
-        etag = response["ETag"]
         entry["parts"][str(part_number)] = etag
         entry["uploaded_bytes"] = (
             uploaded_bytes + part_number * MULTIPART_PART_SIZE
@@ -198,29 +203,33 @@ def upload_large_file(
         )
         save_status_file(status, Path(STATUS_FILE_NAME))
 
-        uploaded_bytes = entry["uploaded_bytes"]
         progress.update(part_size)
         _log_file_progress(
             key,
-            uploaded_bytes,
+            entry["uploaded_bytes"],
             size,
             progress,
             part_number,
             part_count,
         )
 
-    part_info = {
-        "Parts": [
-            {"PartNumber": int(n), "ETag": etag}
-            for n, etag in sorted(entry["parts"].items(), key=lambda x: int(x[0]))
-        ]
-    }
-    s3_client.complete_multipart_upload(
-        Bucket=bucket,
-        Key=key,
-        UploadId=upload_id,
-        MultipartUpload=part_info,
-    )
+    # Complete multipart upload
+    if dry_run:
+        logging.debug(f"DRY-RUN complete multipart upload for {key}")
+    else:
+        part_info = {
+            "Parts": [
+                {"PartNumber": int(n), "ETag": etag}
+                for n, etag in sorted(entry["parts"].items(), key=lambda x: int(x[0]))
+            ]
+        }
+        s3_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload=part_info,
+        )
+
     entry["status"] = "completed"
     save_status_file(status, Path(STATUS_FILE_NAME))
 
@@ -328,7 +337,7 @@ def main() -> None:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Analyze and log actions without uploading or writing S3 objects",
+        help="Simulate uploads and update status without touching S3",
     )
     parser.add_argument(
         "--cleanup",
@@ -409,6 +418,8 @@ def main() -> None:
 
     if not args.dry_run:
         logging.info("All uploads completed successfully")
+    else:
+        logging.info("DRY-RUN completed, status file reflects simulated uploads")
 
 
 if __name__ == "__main__":
