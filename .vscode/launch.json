@@ -3,7 +3,7 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Upload to S3",
+            "name": "Real upload to S3",
             "type": "python",
             "request": "launch",
             "module": "uploader",
@@ -17,7 +17,7 @@
             "justMyCode": true
         },
         {
-            "name": "Upload to S3 (dry run)",
+            "name": "Dry-run upload to S3",
             "type": "python",
             "request": "launch",
             "module": "uploader",
