@@ -1,0 +1,50 @@
+{
+    // VS Code debug configurations for uploader.py
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Upload to S3",
+            "type": "python",
+            "request": "launch",
+            "module": "uploader",
+            "args": [
+                "--bucket",
+                "file-backups-raichu",
+                "--directory",
+                "U:/Vic",
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Upload to S3 (dry run)",
+            "type": "python",
+            "request": "launch",
+            "module": "uploader",
+            "args": [
+                "--bucket",
+                "file-backups-raichu",
+                "--directory",
+                "U:/Vic",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Cleanup multipart uploads",
+            "type": "python",
+            "request": "launch",
+            "module": "uploader",
+            "args": [
+                "--bucket",
+                "file-backups-raichu",
+                "--directory",
+                "U:/Vic",
+                "--cleanup"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}
