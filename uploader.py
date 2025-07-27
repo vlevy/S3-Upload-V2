@@ -154,7 +154,7 @@ def upload_large_file(
     if dry_run:
         pending = part_count - len(uploaded_parts)
         logging.info(
-            f"DRY-RUN multipart upload {key}, {pending}/{part_count} parts pending"
+            f'DRY-RUN multipart upload "{key}", {pending}/{part_count} parts pending'
         )
         return
 
@@ -288,7 +288,8 @@ def cleanup_multipart_uploads(
 
 
 def prepare_job(directory: Path, status_path: Path) -> tuple[list[Path], StatusDict]:
-    all_files = [f for f in directory.rglob("*") if f.is_file()]
+    logging.info(f"Gathering file list for {directory}")
+    all_files = [f for f in directory.glob("*") if f.is_file()]
     status = load_status_file(status_path)
 
     for file_path in all_files:
@@ -362,9 +363,10 @@ def main() -> None:
             {str(p.relative_to(root_dir).as_posix()) for p in pending_files},
             args.dry_run,
         )
+        return
 
     if pending_count == 0:
-        logging.info("No pending uploads after cleanup, exiting")
+        logging.info("No pending uploads, exiting")
         return
 
     logging.info(
