@@ -4,10 +4,10 @@ Robust, resumable, operationally aware uploader for large local files to S3.
 
 Behavior overview
 =================
-* Files < 250 MiB ― upload with a single PUT Object
-* Files ≥ 250 MiB ― upload with 50 MiB multipart chunks
-* Upload progress and state persist in a human‑readable YAML file (`upload_status.yaml`)
-* Supports dry‑run and cleanup modes
+* Files < 250 MiB, upload with a single PUT Object
+* Files >= 250 MiB, upload with 50 MiB multipart chunks
+* Upload progress and state persist in a human-readable YAML file (`upload_status.yaml`)
+* Supports dry-run and cleanup modes
 * Emits detailed progress, percentage, and ETA after each successful operation
 * Uses the default boto3 credential discovery chain
 """
@@ -28,12 +28,13 @@ import botocore
 import yaml
 
 # Constants
-SINGLE_PART_THRESHOLD: int = 250 * 1024 * 1024  # 250 MiB
-MULTIPART_PART_SIZE: int = 50 * 1024 * 1024  # 50 MiB
+SINGLE_PART_THRESHOLD: int = 250 * 1024 * 1024  # 250 MiB
+MULTIPART_PART_SIZE: int = 50 * 1024 * 1024  # 50 MiB
 STATUS_FILE_NAME: str = "upload_status.yaml"
 
 # Typing helpers
 StatusDict = dict[str, Any]
+
 
 # ------------------------------------------------------------------------------
 # Logging configuration
@@ -118,10 +119,10 @@ def upload_small_file(
 ) -> None:
     size = path.stat().st_size
     if dry_run:
-        logging.info("DRY‑RUN single‑part upload %s (%d bytes)", key, size)
+        logging.info(f"DRY-RUN single-part upload {key} ({size} bytes)")
         return
 
-    logging.debug("Uploading small file %s", key)
+    logging.debug(f"Uploading small file {key}")
     s3_client.upload_file(
         Filename=str(path),
         Bucket=bucket,
@@ -153,15 +154,12 @@ def upload_large_file(
     if dry_run:
         pending = part_count - len(uploaded_parts)
         logging.info(
-            "DRY‑RUN multipart upload %s, %d/%d parts pending",
-            key,
-            pending,
-            part_count,
+            f"DRY-RUN multipart upload {key}, {pending}/{part_count} parts pending"
         )
         return
 
     if entry.get("upload_id") is None:
-        logging.debug("Initiating multipart upload for %s", key)
+        logging.debug(f"Initiating multipart upload for {key}")
         upload_id = s3_client.create_multipart_upload(Bucket=bucket, Key=key)[
             "UploadId"
         ]
@@ -183,7 +181,7 @@ def upload_large_file(
             f.seek(offset)
             data = f.read(part_size)
 
-        logging.debug("Uploading part %d/%d for %s", part_number, part_count, key)
+        logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
         response = s3_client.upload_part(
             Bucket=bucket,
             Key=key,
@@ -211,7 +209,6 @@ def upload_large_file(
             part_count,
         )
 
-    # Complete multipart upload
     part_info = {
         "Parts": [
             {"PartNumber": int(n), "ETag": etag}
@@ -245,13 +242,8 @@ def _log_file_progress(
         f" part {part_number}/{part_count}," if part_number and part_count else ""
     )
     logging.info(
-        "%s%s %.2f%% complete, file ETA %s | job %.2f%% complete, job ETA %s",
-        key,
-        part_text,
-        file_pct,
-        file_eta,
-        total_pct,
-        total_eta,
+        f"{key}{part_text} {file_pct:.2f}% complete, file ETA {file_eta} | "
+        f"job {total_pct:.2f}% complete, job ETA {total_eta}"
     )
 
 
@@ -266,7 +258,7 @@ def cleanup_multipart_uploads(
     local_keys: set[str],
     dry_run: bool,
 ) -> None:
-    logging.info("Scanning bucket %s for stale multipart uploads", bucket)
+    logging.info(f"Scanning bucket {bucket} for stale multipart uploads")
     paginator = s3_client.get_paginator("list_multipart_uploads")
     aborted = 0
 
@@ -275,7 +267,7 @@ def cleanup_multipart_uploads(
             key = upload["Key"]
             upload_id = upload["UploadId"]
             if key not in local_keys:
-                logging.info("Aborting stale upload %s (UploadId %s)", key, upload_id)
+                logging.info(f"Aborting stale upload {key} (UploadId {upload_id})")
                 if not dry_run:
                     s3_client.abort_multipart_upload(
                         Bucket=bucket,
@@ -287,7 +279,7 @@ def cleanup_multipart_uploads(
     if aborted == 0:
         logging.info("No stale multipart uploads found")
     else:
-        logging.info("Finished cleanup, %d multipart uploads aborted", aborted)
+        logging.info(f"Finished cleanup, {aborted} multipart uploads aborted")
 
 
 # ------------------------------------------------------------------------------
@@ -310,7 +302,9 @@ def prepare_job(directory: Path, status_path: Path) -> tuple[list[Path], StatusD
 
 
 def summarize_plan(
-    pending_files: list[Path], status: StatusDict, directory: Path
+    pending_files: list[Path],
+    status: StatusDict,
+    directory: Path,
 ) -> tuple[int, int]:
     total_bytes = sum(
         status[str(f.relative_to(directory).as_posix())]["size"] for f in pending_files
@@ -347,7 +341,7 @@ def main() -> None:
     root_dir = Path(args.directory).expanduser().resolve()
     if not root_dir.is_dir():
         logging.error(
-            "Specified directory %s does not exist or is not a directory", root_dir
+            f"Specified directory {root_dir} does not exist or is not a directory"
         )
         sys.exit(1)
 
@@ -374,9 +368,8 @@ def main() -> None:
         return
 
     logging.info(
-        "Starting upload, %d pending files, %.2f MiB total",
-        pending_count,
-        pending_bytes / 1024 / 1024,
+        f"Starting upload, {pending_count} pending files, "
+        f"{pending_bytes / 1024 / 1024:.2f} MiB total"
     )
 
     progress = ProgressTracker(pending_bytes)
@@ -408,7 +401,7 @@ def main() -> None:
                 )
             save_status_file(status, status_file)
         except Exception:  # noqa: BLE001
-            logging.exception("Upload failed for %s, will retry on next run", key)
+            logging.exception(f"Upload failed for {key}, will retry on next run")
             save_status_file(status, status_file)
             raise
 
