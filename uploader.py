@@ -111,34 +111,19 @@ class ProgressTracker:
     """
 
     def __init__(self, total_bytes: int) -> None:
-        """
-        Initialize the progress tracker.
-
-        Args:
-            total_bytes: The total size of the upload.
-        """
         self.total_bytes: int = total_bytes
         self.start_time: datetime = datetime.now()
         self.uploaded_bytes: int = 0
 
     def update(self, delta: int) -> None:
-        """
-        Update the progress tracker.
-
-        Args:
-            delta: The amount of bytes uploaded.
-        """
         self.uploaded_bytes += delta
 
-    @staticmethod
-    def _eta(start_time: datetime, completed: int, total: int) -> str:
-        """
-        Calculate the ETA for the upload.
+    # ----------  Remaining‑time helpers (formerly mis‑named “ETA”)  ----------
 
-        Args:
-            start_time: The datetime when the upload started.
-            completed: The number of bytes uploaded.
-            total: The total size of the upload.
+    @staticmethod
+    def time_remaining(start_time: datetime, completed: int, total: int) -> str:
+        """
+        Return the remaining duration (HH:MM:SS) until completion.
         """
         if completed == 0:
             return "--:--:--"
@@ -147,11 +132,38 @@ class ProgressTracker:
         remaining = (total - completed) / rate if rate else 0
         return str(timedelta(seconds=int(remaining)))
 
+    def time_remaining_total(self) -> str:
+        """
+        Return the remaining duration (HH:MM:SS) for the overall job.
+        """
+        return self.time_remaining(
+            self.start_time, self.uploaded_bytes, self.total_bytes
+        )
+
+    # --------------------  True ETA (expected completion) --------------------
+
+    @staticmethod
+    def estimated_completion_time(
+        start_time: datetime, completed: int, total: int
+    ) -> str:
+        """
+        Return the expected completion time in “Month Day HH:MM” format.
+        """
+        if completed == 0:
+            return "-- --- --:--"
+        elapsed = (datetime.now() - start_time).total_seconds()
+        rate = completed / elapsed
+        remaining = (total - completed) / rate if rate else 0
+        eta_dt = datetime.now() + timedelta(seconds=int(remaining))
+        return eta_dt.strftime("%A %H:%M")
+
     def eta_total(self) -> str:
         """
-        Calculate the ETA for the total upload.
+        Return the expected completion time for the overall job.
         """
-        return self._eta(self.start_time, self.uploaded_bytes, self.total_bytes)
+        return self.estimated_completion_time(
+            self.start_time, self.uploaded_bytes, self.total_bytes
+        )
 
 
 # ------------------------------------------------------------------------------
@@ -196,7 +208,7 @@ def upload_small_file(
     progress.update(size)
     save_status_file(status, status_file)
 
-    _log_file_progress(key, size, size, progress)
+    log_file_progress(key, size, size, progress)
 
 
 def upload_large_file(
@@ -275,7 +287,7 @@ def upload_large_file(
         save_status_file(status, status_file)
 
         progress.update(part_size)
-        _log_file_progress(
+        log_file_progress(
             key,
             file_uploaded,
             size,
@@ -305,7 +317,7 @@ def upload_large_file(
     save_status_file(status, status_file)
 
 
-def _log_file_progress(
+def log_file_progress(
     key: str,
     file_uploaded: int,
     file_size: int,
@@ -313,25 +325,26 @@ def _log_file_progress(
     part_number: int | None = None,
     part_count: int | None = None,
 ) -> None:
-    """
-    Log the progress of the upload.
-
-    Args:
-        key: The key of the file.
-        file_uploaded: The number of bytes uploaded.
-        file_size: The size of the file.
-    """
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
-    file_eta = ProgressTracker._eta(progress.start_time, file_uploaded, file_size)
+
+    file_remaining = ProgressTracker.time_remaining(
+        progress.start_time, file_uploaded, file_size
+    )
+    file_eta = ProgressTracker.estimated_completion_time(
+        progress.start_time, file_uploaded, file_size
+    )
+    total_remaining = progress.time_remaining_total()
     total_eta = progress.eta_total()
 
     part_text = (
         f" part {part_number}/{part_count}," if part_number and part_count else ""
     )
     logging.info(
-        f"{key}{part_text} {file_pct:.2f}% complete, file ETA {file_eta} | "
-        f"job {total_pct:.2f}% complete, job ETA {total_eta}"
+        f"{key}{part_text} {file_pct:.2f}% complete, "
+        f"file remaining {file_remaining}, file ETA {file_eta} | "
+        f"job {total_pct:.2f}% complete, "
+        f"job remaining {total_remaining}, job ETA {total_eta}"
     )
 
 
