@@ -106,8 +106,15 @@ def init_file_entry(status: StatusDict, key: str, size: int) -> None:
 # ------------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# Progress / ETA helpers
+# --------------------------------------------------------------------------
+
+
 class ProgressTracker:
-    """Track overall progress and expose remaining‑time / ETA helpers."""
+    """
+    Track the progress of the upload.
+    """
 
     def __init__(self, total_bytes: int) -> None:
         self.total_bytes: int = total_bytes
@@ -118,60 +125,64 @@ class ProgressTracker:
         self._history: deque[tuple[datetime, int]] = deque()
         self._history.append((self.start_time, 0))
 
+    # ----------------------------- internals ------------------------------
+
     def _trim_history(self, now: datetime) -> None:
-        """Drop samples older than the rate calculation window."""
+        """Discard samples older than RATE_CALCULATION_WINDOW_MINUTES."""
         cutoff = now - timedelta(minutes=RATE_CALCULATION_WINDOW_MINUTES)
         while len(self._history) > 1 and self._history[0][0] < cutoff:
             self._history.popleft()
 
-    def _current_rate(self, completed: int) -> float:
+    def _current_rate(self) -> float:
         """
         Return bytes‑per‑second averaged over either
-        * the full elapsed time (if not enough history yet) or
+        * the full elapsed time (until the window fills), or
         * the most recent RATE_CALCULATION_WINDOW_MINUTES.
         """
         now = datetime.now()
         self._trim_history(now)
 
-        # Use full interval until the window length is reached
         first_ts, first_bytes = self._history[0]
         age = (now - first_ts).total_seconds()
-        if age == 0:  # avoid div‑by‑zero for extremely fast operations
+        if age == 0:  # pathological edge
             return 0.0
-        bytes_delta = completed - first_bytes
+        bytes_delta = self.uploaded_bytes - first_bytes
         return bytes_delta / age
 
-    # ------------------------------------------------------------------ updates
+    # ------------------------------ updates -------------------------------
 
     def update(self, delta: int) -> None:
+        """Advance counters and record a history sample."""
         self.uploaded_bytes += delta
         self._history.append((datetime.now(), self.uploaded_bytes))
 
-    # ------------------------- remaining‑time helpers -------------------------
+    # -------------------------- remaining time ----------------------------
 
     def time_remaining(self, completed: int, total: int) -> str:
-        """Return HH:MM:SS remaining, using rolling‑window rate."""
+        """Return HH:MM:SS remaining, based on rolling‑window job rate."""
         if completed == 0:
             return "--:--:--"
-        rate = self._current_rate(completed)
+        rate = self._current_rate()
         remaining = (total - completed) / rate if rate else 0
         return str(timedelta(seconds=int(remaining)))
 
     def time_remaining_total(self) -> str:
+        """Remaining time for the whole job."""
         return self.time_remaining(self.uploaded_bytes, self.total_bytes)
 
-    # --------------------------- true ETA helpers -----------------------------
+    # ------------------------------ ETA -----------------------------------
 
     def estimated_completion_time(self, completed: int, total: int) -> str:
-        """Return expected finish time as “Weekday HH:MM”."""
+        """Return expected finish time as 'Weekday HH:MM'."""
         if completed == 0:
             return "-- --- --:--"
-        rate = self._current_rate(completed)
+        rate = self._current_rate()
         remaining = (total - completed) / rate if rate else 0
         eta_dt = datetime.now() + timedelta(seconds=int(remaining))
         return eta_dt.strftime("%A %H:%M")
 
     def eta_total(self) -> str:
+        """ETA for the whole job."""
         return self.estimated_completion_time(self.uploaded_bytes, self.total_bytes)
 
 
@@ -336,11 +347,6 @@ def log_file_progress(
 ) -> None:
     """
     Log the progress of the upload.
-
-    Args:
-        file_name: The name of the file.
-        file_uploaded: The number of bytes uploaded.
-        file_size: The size of the file.
     """
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
