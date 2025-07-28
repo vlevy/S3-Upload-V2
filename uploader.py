@@ -15,6 +15,7 @@ Behavior overview
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import logging
 import math
 import sys
@@ -289,7 +290,7 @@ def upload_large_file(
         part_size = min(MULTIPART_PART_SIZE, bytes_left)
 
         if dry_run:
-            time.sleep(0.25)  # simulate negligible latency
+            time.sleep(0.1)  # simulate negligible latency
             etag = f"dry-run-etag-{part_number}"
         else:
             logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
@@ -362,14 +363,11 @@ def log_file_progress(
     total_remaining = progress.time_remaining_total()
     total_eta = progress.eta_total()
 
-    part_text = (
-        f"part {part_number}/{part_count}," if part_number and part_count else ""
-    )
+    part_text = f"{part_number}/{part_count}" if part_number and part_count else ""
     logging.info(
-        f'"{file_name}" {part_text} {file_pct:.2f}% complete, '
-        f"file remaining {file_remaining}, file ETA {file_eta} | "
-        f"job {total_pct:.2f}% complete, "
-        f"job remaining {total_remaining}, job ETA {total_eta}"
+        f'FILE "{file_name}" {part_text} {file_pct:.2f}% '
+        f"{file_remaining} left, {file_eta} ETA | "
+        f"JOB {total_pct:.2f}% {total_remaining} left, {total_eta} ETA"
     )
 
 
@@ -421,25 +419,53 @@ def cleanup_multipart_uploads(
 # ------------------------------------------------------------------------------
 
 
-def prepare_job(directory: Path, status_path: Path) -> tuple[list[Path], StatusDict]:
+def collect_files(
+    root: Path,
+    recursive: bool,
+    include_pat: str,
+    exclude_pats: list[str],
+) -> list[Path]:
     """
-    Prepare the job for the upload.
+    Return all files under *root* that match *include_pat* and
+    do **not** match any pattern in *exclude_pats*.
+    """
+    iterator = root.rglob("*") if recursive else root.glob("*")
+    files: list[Path] = []
 
-    Args:
-        directory: The directory to upload.
-        status_path: The path to the status file.
+    for path in iterator:
+        if not path.is_file():
+            continue
+        rel = path.relative_to(root).as_posix()
+        if include_pat and not fnmatch.fnmatch(rel, include_pat):
+            continue
+        if any(fnmatch.fnmatch(rel, pat) for pat in exclude_pats):
+            continue
+        files.append(path)
+
+    return sorted(files)
+
+
+def prepare_job(
+    directory: Path,
+    status_path: Path,
+    recursive: bool,
+    include_pat: str,
+    exclude_pats: list[str],
+) -> tuple[list[Path], StatusDict]:
+    """
+    Build the pending‑file list, applying include/exclude filters.
     """
     logging.info(f"Gathering file list for {directory}")
-    all_files = [f for f in directory.glob("*") if f.is_file()]
+    all_files = collect_files(directory, recursive, include_pat, exclude_pats)
+
     status = load_status_file(status_path)
-
     for file_path in all_files:
-        file_name = str(file_path.relative_to(directory).as_posix())
-        init_file_entry(status, file_name, file_path.stat().st_size)
+        rel_key = str(file_path.relative_to(directory).as_posix())
+        init_file_entry(status, rel_key, file_path.stat().st_size)
 
-    pending_files = [
+    pending_files = sorted(
         directory / key for key, meta in status.items() if meta["status"] != "completed"
-    ]
+    )
     return pending_files, status
 
 
@@ -508,6 +534,29 @@ def main() -> None:
         action="store_true",
         help="Abort multipart uploads for keys not present locally",
     )
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recurse into sub‑directories when gathering files",
+    )
+    parser.add_argument(
+        "--include",
+        default="*",
+        metavar="GLOB",
+        help="Glob pattern to include (default: '*')",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="Glob pattern(s) to exclude; can be given multiple times",
+    )
+    parser.add_argument(
+        "--list-files",
+        action="store_true",
+        help="Show the final list of files to upload, then continue",
+    )
 
     # Parse arguments
     args = parser.parse_args()
@@ -530,8 +579,20 @@ def main() -> None:
     status_file_path = (root_dir / status_file_name).resolve()
 
     # Prepare the job
-    pending_files, status = prepare_job(root_dir, status_file_path)
+    pending_files, status = prepare_job(
+        root_dir,
+        status_file_path,
+        recursive=args.recursive,
+        include_pat=args.include,
+        exclude_pats=args.exclude,
+    )
     pending_count, pending_bytes = summarize_plan(pending_files, status, root_dir)
+
+    if args.list_files:
+        logging.info("Files to be uploaded:")
+        for i, p in enumerate(pending_files):
+            logging.info(f'  {i + 1}. "{p.relative_to(root_dir).as_posix()}"')
+        # continue with normal processing
 
     if args.cleanup:
         # Cleanup multipart uploads
@@ -561,8 +622,7 @@ def main() -> None:
 
     # Upload files
     for local_path in pending_files:
-        if not "Files"
-        key = str(local_path.relative_to(root_dir).as_posix())
+        file_name = str(local_path.relative_to(root_dir).as_posix())
         file_size = local_path.stat().st_size
 
         try:
@@ -570,7 +630,7 @@ def main() -> None:
                 upload_small_file(
                     s3_client,
                     args.bucket,
-                    key,
+                    file_name,
                     local_path,
                     status,
                     progress,
@@ -581,7 +641,7 @@ def main() -> None:
                 upload_large_file(
                     s3_client,
                     args.bucket,
-                    key,
+                    file_name,
                     local_path,
                     status,
                     progress,
@@ -589,7 +649,7 @@ def main() -> None:
                     status_file_path,
                 )
         except Exception:  # noqa: BLE001
-            logging.exception(f"Upload failed for {key}, will retry on next run")
+            logging.exception(f"Upload failed for {file_name}, will retry on next run")
             save_status_file(status, status_file_path)
             raise
 

@@ -28,7 +28,12 @@
                 "file-backups-raichu",
                 "--directory",
                 "U:/Vic",
-                "--dry-run"
+                "--dry-run",
+                "--include",
+                "Files 1*",
+                "--exclude",
+                "*FROM AWS",
+                "--list-files"
             ],
             "console": "integratedTerminal",
             "justMyCode": true
