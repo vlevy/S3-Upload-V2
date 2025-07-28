@@ -434,8 +434,8 @@ def prepare_job(directory: Path, status_path: Path) -> tuple[list[Path], StatusD
     status = load_status_file(status_path)
 
     for file_path in all_files:
-        rel_key = str(file_path.relative_to(directory).as_posix())
-        init_file_entry(status, rel_key, file_path.stat().st_size)
+        file_name = str(file_path.relative_to(directory).as_posix())
+        init_file_entry(status, file_name, file_path.stat().st_size)
 
     pending_files = [
         directory / key for key, meta in status.items() if meta["status"] != "completed"
@@ -562,6 +562,7 @@ def main() -> None:
 
     # Upload files
     for local_path in pending_files:
+        if not "Files"
         key = str(local_path.relative_to(root_dir).as_posix())
         file_size = local_path.stat().st_size
 
