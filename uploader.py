@@ -30,7 +30,6 @@ import yaml
 # Constants
 SINGLE_PART_THRESHOLD: int = 250 * 1024 * 1024  # 250 MiB
 MULTIPART_PART_SIZE: int = 50 * 1024 * 1024  # 50 MiB
-STATUS_FILE_NAME: str = "upload_status.yaml"
 
 # Typing helpers
 StatusDict = dict[str, Any]
@@ -41,10 +40,15 @@ StatusDict = dict[str, Any]
 # ------------------------------------------------------------------------------
 
 
-def configure_logging(level: str = "DEBUG") -> None:
+def configure_logging(level: str = "DEBUG", dry_run: bool = False) -> None:
+    # If in dry-run mode, prefix all messages with "DRY-RUN"
+    log_format = "%(asctime)s.%(msecs)03d | %(levelname)s | %(lineno)d | %(funcName)s | %(message)s"
+    if dry_run:
+        log_format = f"DRY-RUN | {log_format}"
+
     logging.basicConfig(
         level=getattr(logging, level.upper()),
-        format="%(asctime)s.%(msecs)03d | %(levelname)s | %(lineno)d | %(funcName)s | %(message)s",
+        format=log_format,
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
@@ -55,6 +59,12 @@ def configure_logging(level: str = "DEBUG") -> None:
 
 
 def load_status_file(path: Path) -> StatusDict:
+    """
+    Load the status of the upload from a file.
+
+    Args:
+        path: The path to the status file.
+    """
     if path.exists():
         with path.open("r", encoding="utf-8") as f:
             return yaml.safe_load(f) or {}
@@ -62,11 +72,26 @@ def load_status_file(path: Path) -> StatusDict:
 
 
 def save_status_file(status: StatusDict, path: Path) -> None:
+    """
+    Save the status of the upload to a file.
+
+    Args:
+        status: The status of the upload.
+        path: The path to the status file.
+    """
     with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(status, f)
+        yaml.safe_dump(status, f, sort_keys=False)
 
 
 def init_file_entry(status: StatusDict, key: str, size: int) -> None:
+    """
+    Initialize the status of a file.
+
+    Args:
+        status: The status of the upload.
+        key: The key of the file.
+        size: The size of the file.
+    """
     if key not in status:
         status[key] = {
             "size": size,
@@ -81,16 +106,40 @@ def init_file_entry(status: StatusDict, key: str, size: int) -> None:
 
 
 class ProgressTracker:
+    """
+    Track the progress of the upload.
+    """
+
     def __init__(self, total_bytes: int) -> None:
+        """
+        Initialize the progress tracker.
+
+        Args:
+            total_bytes: The total size of the upload.
+        """
         self.total_bytes: int = total_bytes
         self.start_time: float = time.time()
         self.uploaded_bytes: int = 0
 
     def update(self, delta: int) -> None:
+        """
+        Update the progress tracker.
+
+        Args:
+            delta: The amount of bytes uploaded.
+        """
         self.uploaded_bytes += delta
 
     @staticmethod
     def _eta(start_time: float, completed: int, total: int) -> str:
+        """
+        Calculate the ETA for the upload.
+
+        Args:
+            start_time: The time the upload started.
+            completed: The number of bytes uploaded.
+            total: The total size of the upload.
+        """
         if completed == 0:
             return "--:--:--"
         elapsed = time.time() - start_time
@@ -99,6 +148,9 @@ class ProgressTracker:
         return str(timedelta(seconds=int(remaining)))
 
     def eta_total(self) -> str:
+        """
+        Calculate the ETA for the total upload.
+        """
         return self._eta(self.start_time, self.uploaded_bytes, self.total_bytes)
 
 
@@ -115,7 +167,16 @@ def upload_small_file(
     status: StatusDict,
     progress: ProgressTracker,
     dry_run: bool,
+    status_file: Path,
 ) -> None:
+    """
+    Upload a small file to S3.
+
+    Args:
+        s3_client: The S3 client.
+        bucket: The bucket to upload the file to.
+        key: The key of the file.
+    """
     size = path.stat().st_size
 
     if dry_run:
@@ -133,6 +194,8 @@ def upload_small_file(
     status[key]["status"] = "completed"
     status[key]["uploaded_bytes"] = size
     progress.update(size)
+    save_status_file(status, status_file)
+
     _log_file_progress(key, size, size, progress)
 
 
@@ -144,19 +207,28 @@ def upload_large_file(
     status: StatusDict,
     progress: ProgressTracker,
     dry_run: bool,
+    status_file: Path,
 ) -> None:
-    size = path.stat().st_size
-    part_count = math.ceil(size / MULTIPART_PART_SIZE)
+    """
+    Upload a large file to S3.
+
+    Args:
+        s3_client: The S3 client.
+        bucket: The bucket to upload the file to.
+        key: The key of the file.
+    """
 
     entry = status[key]
+    size = entry["size"]
+    part_count = math.ceil(size / MULTIPART_PART_SIZE)
     uploaded_parts: dict[int, str] = entry.get("parts", {})
-    uploaded_bytes = entry.get("uploaded_bytes", 0)
+    file_uploaded = entry.get("uploaded_bytes", 0)  # running byte counter
 
     # Create or reuse an upload ID
     if entry.get("upload_id") is None:
         if dry_run:
             upload_id = f"dry-run-{int(time.time())}"
-            logging.debug(f"DRY-RUN create fake multipart upload {key} id={upload_id}")
+            logging.debug(f"Create fake multipart upload {key} id={upload_id}")
         else:
             logging.debug(f"Initiating multipart upload for {key}")
             upload_id = s3_client.create_multipart_upload(
@@ -165,13 +237,13 @@ def upload_large_file(
             )["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
-        save_status_file(status, Path(STATUS_FILE_NAME))
+        save_status_file(status, status_file)
 
     upload_id = entry["upload_id"]
 
     # Loop over every missing part
     for part_number in range(1, part_count + 1):
-        if str(part_number) in uploaded_parts:
+        if part_number in uploaded_parts:
             continue
 
         offset = (part_number - 1) * MULTIPART_PART_SIZE
@@ -179,8 +251,7 @@ def upload_large_file(
         part_size = min(MULTIPART_PART_SIZE, bytes_left)
 
         if dry_run:
-            logging.debug(f"DRY-RUN upload part {part_number}/{part_count} for {key}")
-            time.sleep(0)  # simulate negligible latency
+            time.sleep(0.25)  # simulate negligible latency
             etag = f"dry-run-etag-{part_number}"
         else:
             logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
@@ -195,18 +266,18 @@ def upload_large_file(
                 Body=data,
             )["ETag"]
 
-        entry["parts"][str(part_number)] = etag
-        entry["uploaded_bytes"] = (
-            uploaded_bytes + part_number * MULTIPART_PART_SIZE
-            if part_number < part_count
-            else size
-        )
-        save_status_file(status, Path(STATUS_FILE_NAME))
+        # record completed part
+        entry["parts"][part_number] = etag
+
+        file_uploaded += part_size  # advance running total
+        entry["uploaded_bytes"] = file_uploaded
+
+        save_status_file(status, status_file)
 
         progress.update(part_size)
         _log_file_progress(
             key,
-            entry["uploaded_bytes"],
+            file_uploaded,
             size,
             progress,
             part_number,
@@ -215,12 +286,12 @@ def upload_large_file(
 
     # Complete multipart upload
     if dry_run:
-        logging.debug(f"DRY-RUN complete multipart upload for {key}")
+        logging.debug(f"Complete multipart upload for {key}")
     else:
         part_info = {
             "Parts": [
-                {"PartNumber": int(n), "ETag": etag}
-                for n, etag in sorted(entry["parts"].items(), key=lambda x: int(x[0]))
+                {"PartNumber": n, "ETag": etag}
+                for n, etag in sorted(entry["parts"].items())
             ]
         }
         s3_client.complete_multipart_upload(
@@ -231,7 +302,7 @@ def upload_large_file(
         )
 
     entry["status"] = "completed"
-    save_status_file(status, Path(STATUS_FILE_NAME))
+    save_status_file(status, status_file)
 
 
 def _log_file_progress(
@@ -242,6 +313,14 @@ def _log_file_progress(
     part_number: int | None = None,
     part_count: int | None = None,
 ) -> None:
+    """
+    Log the progress of the upload.
+
+    Args:
+        key: The key of the file.
+        file_uploaded: The number of bytes uploaded.
+        file_size: The size of the file.
+    """
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
     file_eta = ProgressTracker._eta(progress.start_time, file_uploaded, file_size)
@@ -267,6 +346,14 @@ def cleanup_multipart_uploads(
     local_keys: set[str],
     dry_run: bool,
 ) -> None:
+    """
+    Abort multipart uploads for keys not present locally.
+
+    Args:
+        s3_client: The S3 client.
+        bucket: The bucket to scan for stale multipart uploads.
+        local_keys: The keys of the files that are present locally.
+    """
     logging.info(f"Scanning bucket {bucket} for stale multipart uploads")
     paginator = s3_client.get_paginator("list_multipart_uploads")
     aborted = 0
@@ -297,6 +384,13 @@ def cleanup_multipart_uploads(
 
 
 def prepare_job(directory: Path, status_path: Path) -> tuple[list[Path], StatusDict]:
+    """
+    Prepare the job for the upload.
+
+    Args:
+        directory: The directory to upload.
+        status_path: The path to the status file.
+    """
     logging.info(f"Gathering file list for {directory}")
     all_files = [f for f in directory.glob("*") if f.is_file()]
     status = load_status_file(status_path)
@@ -316,9 +410,23 @@ def summarize_plan(
     status: StatusDict,
     directory: Path,
 ) -> tuple[int, int]:
+    """
+    Summarize the plan for the upload.
+
+    Args:
+        pending_files: The files that are pending upload.
+        status: The status of the upload.
+        directory: The directory to upload.
+    """
     total_bytes = sum(
         status[str(f.relative_to(directory).as_posix())]["size"] for f in pending_files
     )
+
+    # Subtract the size of the already uploaded parts of pending files
+    for file in pending_files:
+        file_status = status[str(file.relative_to(directory).as_posix())]
+        total_bytes -= file_status["uploaded_bytes"]
+
     return len(pending_files), total_bytes
 
 
@@ -328,11 +436,16 @@ def summarize_plan(
 
 
 def main() -> None:
+    """
+    Main function.
+    """
     parser = argparse.ArgumentParser(description="Upload a directory tree to S3")
     parser.add_argument("--bucket", required=True, help="Destination S3 bucket name")
     parser.add_argument("--directory", required=True, help="Local directory to upload")
     parser.add_argument(
-        "--log-level", default="INFO", help="Logging level (DEBUG, INFO, WARNING...)"
+        "--log-level",
+        default="DEBUG" if "--dry-run" in sys.argv else "INFO",
+        help="Logging level (DEBUG, INFO, WARNING...)",
     )
     parser.add_argument(
         "--dry-run",
@@ -345,9 +458,14 @@ def main() -> None:
         help="Abort multipart uploads for keys not present locally",
     )
 
+    # Parse arguments
     args = parser.parse_args()
-    configure_logging(args.log_level)
+    configure_logging(args.log_level, args.dry_run)
 
+    # Initialize S3 client
+    s3_client = boto3.client("s3")
+
+    # Get root directory and create the status file path
     root_dir = Path(args.directory).expanduser().resolve()
     if not root_dir.is_dir():
         logging.error(
@@ -355,23 +473,27 @@ def main() -> None:
         )
         sys.exit(1)
 
-    s3_client = boto3.client("s3")
-    status_file = root_dir / STATUS_FILE_NAME
+    status_file_name: str = (
+        "upload_status.yaml" if not args.dry_run else "upload_status_dry_run.yaml"
+    )
+    status_file_path = (root_dir / status_file_name).resolve()
 
-    pending_files, status = prepare_job(root_dir, status_file)
+    # Prepare the job
+    pending_files, status = prepare_job(root_dir, status_file_path)
     pending_count, pending_bytes = summarize_plan(pending_files, status, root_dir)
 
-    if pending_count == 0 and not args.cleanup:
-        logging.info("All files already uploaded, exiting")
-        return
-
     if args.cleanup:
+        # Cleanup multipart uploads
         cleanup_multipart_uploads(
             s3_client,
             args.bucket,
             {str(p.relative_to(root_dir).as_posix()) for p in pending_files},
             args.dry_run,
         )
+        return
+
+    if pending_count == 0 and not args.cleanup:
+        logging.info("All files already uploaded, exiting")
         return
 
     if pending_count == 0:
@@ -383,8 +505,10 @@ def main() -> None:
         f"{pending_bytes / 1024 / 1024:.2f} MiB total"
     )
 
+    # Initialize progress tracker
     progress = ProgressTracker(pending_bytes)
 
+    # Upload files
     for local_path in pending_files:
         key = str(local_path.relative_to(root_dir).as_posix())
         file_size = local_path.stat().st_size
@@ -399,6 +523,7 @@ def main() -> None:
                     status,
                     progress,
                     args.dry_run,
+                    status_file_path,
                 )
             else:
                 upload_large_file(
@@ -409,18 +534,19 @@ def main() -> None:
                     status,
                     progress,
                     args.dry_run,
+                    status_file_path,
                 )
-            save_status_file(status, status_file)
         except Exception:  # noqa: BLE001
             logging.exception(f"Upload failed for {key}, will retry on next run")
-            save_status_file(status, status_file)
+            save_status_file(status, status_file_path)
             raise
 
     if not args.dry_run:
         logging.info("All uploads completed successfully")
     else:
-        logging.info("DRY-RUN completed, status file reflects simulated uploads")
+        logging.info("Completed, status file reflects simulated uploads")
 
 
 if __name__ == "__main__":
+    # Run the main function
     main()
