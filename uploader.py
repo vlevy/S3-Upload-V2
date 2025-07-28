@@ -29,8 +29,8 @@ import botocore
 import yaml
 
 # Constants
-SINGLE_PART_THRESHOLD: int = 250 * 1024 * 1024  # 250 MiB
-MULTIPART_PART_SIZE: int = 50 * 1024 * 1024  # 50 MiB
+MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
+SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
 # Typing helpers
 StatusDict = dict[str, Any]
