@@ -325,6 +325,14 @@ def log_file_progress(
     part_number: int | None = None,
     part_count: int | None = None,
 ) -> None:
+    """
+    Log the progress of the upload.
+
+    Args:
+        file_name: The name of the file.
+        file_uploaded: The number of bytes uploaded.
+        file_size: The size of the file.
+    """
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
 
