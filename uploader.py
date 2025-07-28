@@ -19,7 +19,7 @@ import logging
 import math
 import sys
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -118,7 +118,7 @@ class ProgressTracker:
             total_bytes: The total size of the upload.
         """
         self.total_bytes: int = total_bytes
-        self.start_time: float = time.time()
+        self.start_time: datetime = datetime.now()
         self.uploaded_bytes: int = 0
 
     def update(self, delta: int) -> None:
@@ -131,18 +131,18 @@ class ProgressTracker:
         self.uploaded_bytes += delta
 
     @staticmethod
-    def _eta(start_time: float, completed: int, total: int) -> str:
+    def _eta(start_time: datetime, completed: int, total: int) -> str:
         """
         Calculate the ETA for the upload.
 
         Args:
-            start_time: The time the upload started.
+            start_time: The datetime when the upload started.
             completed: The number of bytes uploaded.
             total: The total size of the upload.
         """
         if completed == 0:
             return "--:--:--"
-        elapsed = time.time() - start_time
+        elapsed = (datetime.now() - start_time).total_seconds()
         rate = completed / elapsed
         remaining = (total - completed) / rate if rate else 0
         return str(timedelta(seconds=int(remaining)))
@@ -227,7 +227,7 @@ def upload_large_file(
     # Create or reuse an upload ID
     if entry.get("upload_id") is None:
         if dry_run:
-            upload_id = f"dry-run-{int(time.time())}"
+            upload_id = f"dry-run-{int(datetime.now().timestamp())}"
             logging.debug(f"Create fake multipart upload {key} id={upload_id}")
         else:
             logging.debug(f"Initiating multipart upload for {key}")
