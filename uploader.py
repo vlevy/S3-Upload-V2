@@ -28,6 +28,8 @@ import boto3
 import botocore
 import yaml
 
+g_storage_class: str
+
 # Constants
 MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
@@ -220,7 +222,10 @@ def upload_small_file(
             Filename=str(path),
             Bucket=bucket,
             Key=key,
-            ExtraArgs={"ACL": "private"},
+            ExtraArgs={
+                "ACL": "private",
+                "StorageClass": g_storage_class,
+            },
         )
 
     status[key]["status"] = "completed"
@@ -266,6 +271,7 @@ def upload_large_file(
             upload_id = s3_client.create_multipart_upload(
                 Bucket=bucket,
                 Key=key,
+                StorageClass=g_storage_class,
             )["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
@@ -471,6 +477,7 @@ def main() -> None:
     """
     Main function.
     """
+    global g_storage_class
     parser = argparse.ArgumentParser(description="Upload a directory tree to S3")
     parser.add_argument("--bucket", required=True, help="Destination S3 bucket name")
     parser.add_argument("--directory", required=True, help="Local directory to upload")
@@ -478,6 +485,18 @@ def main() -> None:
         "--log-level",
         default="DEBUG" if "--dry-run" in sys.argv else "INFO",
         help="Logging level (DEBUG, INFO, WARNING...)",
+    )
+    parser.add_argument(
+        "--storage-class",
+        default="STANDARD",
+        choices=[
+            "STANDARD",
+            "STANDARD_IA",
+            "INTELLIGENT_TIERING",
+            "GLACIER",
+            "DEEP_ARCHIVE",
+        ],
+        help="S3 storage class for new objects",
     )
     parser.add_argument(
         "--dry-run",
@@ -493,6 +512,7 @@ def main() -> None:
     # Parse arguments
     args = parser.parse_args()
     configure_logging(args.log_level, args.dry_run)
+    g_storage_class = args.storage_class
 
     # Initialize S3 client
     s3_client = boto3.client("s3")
@@ -534,7 +554,7 @@ def main() -> None:
 
     logging.info(
         f"Starting upload, {pending_count} pending files, "
-        f"{pending_bytes / 1024 / 1024:.2f} MiB total"
+        f"{pending_bytes / 1024 / 1024 / 1024:.2f} GiB total"
     )
 
     # Initialize progress tracker

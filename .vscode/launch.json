@@ -12,6 +12,8 @@
                 "file-backups-raichu",
                 "--directory",
                 "U:/Vic",
+                "--storage-class",
+                "STANDARD_IA"
             ],
             "console": "integratedTerminal",
             "justMyCode": true
