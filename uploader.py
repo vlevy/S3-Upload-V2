@@ -28,7 +28,7 @@ import boto3
 import botocore
 import yaml
 
-g_storage_class: str
+args: argparse.Namespace
 
 # Constants
 MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
@@ -224,7 +224,7 @@ def upload_small_file(
             Key=key,
             ExtraArgs={
                 "ACL": "private",
-                "StorageClass": g_storage_class,
+                "StorageClass": args.storage_class,
             },
         )
 
@@ -271,7 +271,7 @@ def upload_large_file(
             upload_id = s3_client.create_multipart_upload(
                 Bucket=bucket,
                 Key=key,
-                StorageClass=g_storage_class,
+                StorageClass=args.storage_class,
             )["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
@@ -477,7 +477,7 @@ def main() -> None:
     """
     Main function.
     """
-    global g_storage_class
+    global args
     parser = argparse.ArgumentParser(description="Upload a directory tree to S3")
     parser.add_argument("--bucket", required=True, help="Destination S3 bucket name")
     parser.add_argument("--directory", required=True, help="Local directory to upload")
@@ -512,7 +512,6 @@ def main() -> None:
     # Parse arguments
     args = parser.parse_args()
     configure_logging(args.log_level, args.dry_run)
-    g_storage_class = args.storage_class
 
     # Initialize S3 client
     s3_client = boto3.client("s3")
