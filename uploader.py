@@ -318,7 +318,7 @@ def upload_large_file(
 
 
 def log_file_progress(
-    key: str,
+    file_name: str,
     file_uploaded: int,
     file_size: int,
     progress: ProgressTracker,
@@ -338,10 +338,10 @@ def log_file_progress(
     total_eta = progress.eta_total()
 
     part_text = (
-        f" part {part_number}/{part_count}," if part_number and part_count else ""
+        f"part {part_number}/{part_count}," if part_number and part_count else ""
     )
     logging.info(
-        f"{key}{part_text} {file_pct:.2f}% complete, "
+        f'"{file_name}" {part_text} {file_pct:.2f}% complete, '
         f"file remaining {file_remaining}, file ETA {file_eta} | "
         f"job {total_pct:.2f}% complete, "
         f"job remaining {total_remaining}, job ETA {total_eta}"
