@@ -19,6 +19,7 @@ import logging
 import math
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -30,7 +31,7 @@ import yaml
 # Constants
 SINGLE_PART_THRESHOLD: int = 250 * 1024 * 1024  # 250 MiB
 MULTIPART_PART_SIZE: int = 50 * 1024 * 1024  # 50 MiB
-
+RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
 # Typing helpers
 StatusDict = dict[str, Any]
 
@@ -106,64 +107,72 @@ def init_file_entry(status: StatusDict, key: str, size: int) -> None:
 
 
 class ProgressTracker:
-    """
-    Track the progress of the upload.
-    """
+    """Track overall progress and expose remaining‑time / ETA helpers."""
 
     def __init__(self, total_bytes: int) -> None:
         self.total_bytes: int = total_bytes
         self.start_time: datetime = datetime.now()
         self.uploaded_bytes: int = 0
 
+        # (timestamp, uploaded_bytes) samples for rolling‑window rate
+        self._history: deque[tuple[datetime, int]] = deque()
+        self._history.append((self.start_time, 0))
+
+    def _trim_history(self, now: datetime) -> None:
+        """Drop samples older than the rate calculation window."""
+        cutoff = now - timedelta(minutes=RATE_CALCULATION_WINDOW_MINUTES)
+        while len(self._history) > 1 and self._history[0][0] < cutoff:
+            self._history.popleft()
+
+    def _current_rate(self, completed: int) -> float:
+        """
+        Return bytes‑per‑second averaged over either
+        * the full elapsed time (if not enough history yet) or
+        * the most recent RATE_CALCULATION_WINDOW_MINUTES.
+        """
+        now = datetime.now()
+        self._trim_history(now)
+
+        # Use full interval until the window length is reached
+        first_ts, first_bytes = self._history[0]
+        age = (now - first_ts).total_seconds()
+        if age == 0:  # avoid div‑by‑zero for extremely fast operations
+            return 0.0
+        bytes_delta = completed - first_bytes
+        return bytes_delta / age
+
+    # ------------------------------------------------------------------ updates
+
     def update(self, delta: int) -> None:
         self.uploaded_bytes += delta
+        self._history.append((datetime.now(), self.uploaded_bytes))
 
-    # ----------  Remaining‑time helpers (formerly mis‑named “ETA”)  ----------
+    # ------------------------- remaining‑time helpers -------------------------
 
-    @staticmethod
-    def time_remaining(start_time: datetime, completed: int, total: int) -> str:
-        """
-        Return the remaining duration (HH:MM:SS) until completion.
-        """
+    def time_remaining(self, completed: int, total: int) -> str:
+        """Return HH:MM:SS remaining, using rolling‑window rate."""
         if completed == 0:
             return "--:--:--"
-        elapsed = (datetime.now() - start_time).total_seconds()
-        rate = completed / elapsed
+        rate = self._current_rate(completed)
         remaining = (total - completed) / rate if rate else 0
         return str(timedelta(seconds=int(remaining)))
 
     def time_remaining_total(self) -> str:
-        """
-        Return the remaining duration (HH:MM:SS) for the overall job.
-        """
-        return self.time_remaining(
-            self.start_time, self.uploaded_bytes, self.total_bytes
-        )
+        return self.time_remaining(self.uploaded_bytes, self.total_bytes)
 
-    # --------------------  True ETA (expected completion) --------------------
+    # --------------------------- true ETA helpers -----------------------------
 
-    @staticmethod
-    def estimated_completion_time(
-        start_time: datetime, completed: int, total: int
-    ) -> str:
-        """
-        Return the expected completion time in “Month Day HH:MM” format.
-        """
+    def estimated_completion_time(self, completed: int, total: int) -> str:
+        """Return expected finish time as “Weekday HH:MM”."""
         if completed == 0:
             return "-- --- --:--"
-        elapsed = (datetime.now() - start_time).total_seconds()
-        rate = completed / elapsed
+        rate = self._current_rate(completed)
         remaining = (total - completed) / rate if rate else 0
         eta_dt = datetime.now() + timedelta(seconds=int(remaining))
         return eta_dt.strftime("%A %H:%M")
 
     def eta_total(self) -> str:
-        """
-        Return the expected completion time for the overall job.
-        """
-        return self.estimated_completion_time(
-            self.start_time, self.uploaded_bytes, self.total_bytes
-        )
+        return self.estimated_completion_time(self.uploaded_bytes, self.total_bytes)
 
 
 # ------------------------------------------------------------------------------
@@ -336,12 +345,8 @@ def log_file_progress(
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
 
-    file_remaining = ProgressTracker.time_remaining(
-        progress.start_time, file_uploaded, file_size
-    )
-    file_eta = ProgressTracker.estimated_completion_time(
-        progress.start_time, file_uploaded, file_size
-    )
+    file_remaining = progress.time_remaining(file_uploaded, file_size)
+    file_eta = progress.estimated_completion_time(file_uploaded, file_size)
     total_remaining = progress.time_remaining_total()
     total_eta = progress.eta_total()
 
