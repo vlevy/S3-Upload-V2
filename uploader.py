@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import boto3
-import botocore
+import botocore.config as bc
 import yaml
 
 args: argparse.Namespace
@@ -563,7 +563,16 @@ def main() -> None:
     configure_logging(args.log_level, args.dry_run)
 
     # Initialize S3 client
-    s3_client = boto3.client("s3")
+    config = bc.Config(
+        retries={
+            "mode": "adaptive",  # adaptive == exponential back‑off + client‑side rate limiting
+            "max_attempts": 10,  # bump from AWS default (3 or 4)
+        },
+        connect_timeout=10,  # seconds
+        read_timeout=60,
+    )
+
+    s3_client = boto3.client("s3", config=config)
 
     # Get root directory and create the status file path
     root_dir = Path(args.directory).expanduser().resolve()
