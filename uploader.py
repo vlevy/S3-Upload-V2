@@ -41,7 +41,7 @@ RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
 # "SHA256", "CRC32C", "CRC64", … or None to turn it off completely
 CHECKSUM_ALGO: str | None
 CHECKSUM_ALGO = "SHA256"
-CHECKSUM_ALGO = None  # None to disable data integrity
+CHECKSUM_ALGO = None  # Disable data integrity
 
 # Typing helpers
 StatusDict = dict[str, Any]
@@ -112,9 +112,12 @@ def init_file_entry(status: StatusDict, key: str, size: int) -> None:
         }
 
 
-# ------------------------------------------------------------------------------
-# Progress / ETA helpers
-# ------------------------------------------------------------------------------
+def add_to_dict_if(dest: dict[str, str], key: str, value: str | None) -> None:
+    """
+    Add a key to a dictionary only if the value is truthy.
+    """
+    if value:
+        dest[key] = value
 
 
 # --------------------------------------------------------------------------
@@ -227,17 +230,18 @@ def upload_small_file(
         logging.debug(f"DRY-RUN simulate small upload for {key}")
     else:
         logging.debug(f"Uploading small file {key}")
+        extra = {
+            "ACL": "private",
+            "StorageClass": args.storage_class,
+        }
+        add_to_dict_if(extra, "ChecksumAlgorithm", CHECKSUM_ALGO)
+
         s3_client.upload_file(
             Filename=str(path),
             Bucket=bucket,
             Key=key,
-            ExtraArgs={
-                "ACL": "private",
-                "StorageClass": args.storage_class,
-                "ChecksumAlgorithm": CHECKSUM_ALGO,  # request SHA‑256 digest
-            },
+            ExtraArgs=extra,
         )
-
     status[key]["status"] = "completed"
     status[key]["uploaded_bytes"] = size
     progress.update(size)
@@ -249,7 +253,7 @@ def upload_small_file(
 def upload_large_file(
     s3_client: botocore.client.BaseClient,
     bucket: str,
-    key: str,
+    file_name: str,
     path: Path,
     status: StatusDict,
     progress: ProgressTracker,
@@ -262,10 +266,10 @@ def upload_large_file(
     Args:
         s3_client: The S3 client.
         bucket: The bucket to upload the file to.
-        key: The key of the file.
+        file_name: The key of the file.
     """
 
-    entry = status[key]
+    entry = status[file_name]
     size = entry["size"]
     part_count = math.ceil(size / MULTIPART_PART_SIZE)
     uploaded_parts: dict[int, str] = entry.get("parts", {})
@@ -275,15 +279,17 @@ def upload_large_file(
     if entry.get("upload_id") is None:
         if dry_run:
             upload_id = f"dry-run-{int(datetime.now().timestamp())}"
-            logging.debug(f"Create fake multipart upload {key} id={upload_id}")
+            logging.debug(f"Create fake multipart upload {file_name} id={upload_id}")
         else:
-            logging.debug(f"Initiating multipart upload for {key}")
-            upload_id = s3_client.create_multipart_upload(
-                Bucket=bucket,
-                Key=key,
-                StorageClass=args.storage_class,
-                ChecksumAlgorithm=CHECKSUM_ALGO,
-            )["UploadId"]
+            logging.debug(f"Initiating multipart upload for {file_name}")
+            create_kwargs = {
+                "Bucket": bucket,
+                "Key": file_name,
+                "StorageClass": args.storage_class,
+            }
+            add_to_dict_if(create_kwargs, "ChecksumAlgorithm", CHECKSUM_ALGO)
+
+            upload_id = s3_client.create_multipart_upload(**create_kwargs)["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
         save_status_file(status, status_file)
@@ -303,18 +309,20 @@ def upload_large_file(
             time.sleep(0.1)  # simulate negligible latency
             etag = f"dry-run-etag-{part_number}"
         else:
-            logging.debug(f"Uploading part {part_number}/{part_count} for {key}")
+            logging.debug(f"Uploading part {part_number}/{part_count} for {file_name}")
             with path.open("rb") as f:
                 f.seek(offset)
                 data = f.read(part_size)
-            resp = s3_client.upload_part(
-                Bucket=bucket,
-                Key=key,
-                PartNumber=part_number,
-                UploadId=upload_id,
-                Body=data,
-                ChecksumAlgorithm=CHECKSUM_ALGO,
-            )["ETag"]
+            part_kwargs = {
+                "Bucket": bucket,
+                "Key": file_name,
+                "PartNumber": part_number,
+                "UploadId": upload_id,
+                "Body": data,
+            }
+            add_to_dict_if(part_kwargs, "ChecksumAlgorithm", CHECKSUM_ALGO)
+
+            resp = s3_client.upload_part(**part_kwargs)
             etag = resp["ETag"]
 
         # record completed part
@@ -327,7 +335,7 @@ def upload_large_file(
 
         progress.update(part_size)
         log_file_progress(
-            key,
+            file_name,
             file_uploaded,
             size,
             progress,
@@ -337,7 +345,7 @@ def upload_large_file(
 
     # Complete multipart upload
     if dry_run:
-        logging.debug(f"Complete multipart upload for {key}")
+        logging.debug(f"Complete multipart upload for {file_name}")
     else:
         part_info = {
             "Parts": [
@@ -345,13 +353,14 @@ def upload_large_file(
                 for n, etag in sorted(entry["parts"].items())
             ]
         }
-        s3_client.complete_multipart_upload(
-            Bucket=bucket,
-            Key=key,
-            UploadId=upload_id,
-            MultipartUpload=part_info,
-            ChecksumAlgorithm=CHECKSUM_ALGO,
-        )
+        complete_kwargs = {
+            "Bucket": bucket,
+            "Key": file_name,
+            "UploadId": upload_id,
+            "MultipartUpload": part_info,
+        }
+        add_to_dict_if(complete_kwargs, "ChecksumAlgorithm", CHECKSUM_ALGO)
+        s3_client.complete_multipart_upload(**complete_kwargs)
 
     entry["status"] = "completed"
     save_status_file(status, status_file)
