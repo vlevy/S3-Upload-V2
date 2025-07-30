@@ -35,6 +35,14 @@ args: argparse.Namespace
 MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
+
+# Checksum algorithm requested from Amazon S3
+# CHECKSUM_ALGO picks the algorithm or disables integrity
+# "SHA256", "CRC32C", "CRC64", … or None to turn it off completely
+CHECKSUM_ALGO: str | None
+CHECKSUM_ALGO = "SHA256"
+CHECKSUM_ALGO = None  # None to disable data integrity
+
 # Typing helpers
 StatusDict = dict[str, Any]
 
@@ -226,6 +234,7 @@ def upload_small_file(
             ExtraArgs={
                 "ACL": "private",
                 "StorageClass": args.storage_class,
+                "ChecksumAlgorithm": CHECKSUM_ALGO,  # request SHA‑256 digest
             },
         )
 
@@ -273,6 +282,7 @@ def upload_large_file(
                 Bucket=bucket,
                 Key=key,
                 StorageClass=args.storage_class,
+                ChecksumAlgorithm=CHECKSUM_ALGO,
             )["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
@@ -297,13 +307,15 @@ def upload_large_file(
             with path.open("rb") as f:
                 f.seek(offset)
                 data = f.read(part_size)
-            etag = s3_client.upload_part(
+            resp = s3_client.upload_part(
                 Bucket=bucket,
                 Key=key,
                 PartNumber=part_number,
                 UploadId=upload_id,
                 Body=data,
+                ChecksumAlgorithm=CHECKSUM_ALGO,
             )["ETag"]
+            etag = resp["ETag"]
 
         # record completed part
         entry["parts"][part_number] = etag
@@ -338,6 +350,7 @@ def upload_large_file(
             Key=key,
             UploadId=upload_id,
             MultipartUpload=part_info,
+            ChecksumAlgorithm=CHECKSUM_ALGO,
         )
 
     entry["status"] = "completed"
