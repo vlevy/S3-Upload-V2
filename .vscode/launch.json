@@ -12,6 +12,11 @@
                 "file-backups-raichu",
                 "--directory",
                 "U:/Vic",
+                "--include",
+                "Files 23 2025-05",
+                "--exclude",
+                "*FROM AWS",
+                "--list-files",
                 "--storage-class",
                 "STANDARD_IA"
             ],
@@ -30,7 +35,7 @@
                 "U:/Vic",
                 "--dry-run",
                 "--include",
-                "Files 1*",
+                "Files 23 2025-05",
                 "--exclude",
                 "*FROM AWS",
                 "--list-files"

@@ -27,16 +27,19 @@ from pathlib import Path
 from typing import IO, Any
 
 import boto3
-import botocore.config as bc
+import botocore.config
 import yaml
 
 args: argparse.Namespace
 
 # Constants
-MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
+ONE_K = 1024
+ONE_M = ONE_K * ONE_K
+ONE_G = ONE_M * ONE_K
+MULTIPART_PART_SIZE: int = 250 * ONE_M  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
-RATE_LIMIT_BYTES_PER_SEC = 100000000 * 1024 * 1024  # 100 MiB/s
+RATE_LIMIT_BYTES_PER_SEC = 100 * ONE_G
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -307,7 +310,7 @@ def upload_large_file(
             with path.open("rb") as f:
                 f.seek(offset)
                 # buffer in 4 MiB windows so ThrottledReader can sleep frequently
-                buffered = io.BufferedReader(f, buffer_size=4 * 1024 * 1024)
+                buffered = io.BufferedReader(f, buffer_size=4 * ONE_M)
                 # enforce both rate and max-bytes for this part
                 reader = ThrottledReader(
                     buffered,
@@ -319,6 +322,7 @@ def upload_large_file(
                     PartNumber=part_number,
                     UploadId=upload_id,
                     Body=reader,
+                    ContentLength=part_size,
                     **({"ChecksumAlgorithm": CHECKSUM_ALGO} if CHECKSUM_ALGO else {}),
                 )
                 etag = resp["ETag"]
@@ -368,7 +372,7 @@ def log_file_progress(
     part_count: int | None = None,
 ) -> None:
     """
-    Log the progress of the upload.
+    Log the progress of the upload, including effective bytes per second.
     """
     file_pct = file_uploaded / file_size * 100
     total_pct = progress.uploaded_bytes / progress.total_bytes * 100
@@ -378,11 +382,14 @@ def log_file_progress(
     total_remaining = progress.time_remaining_total()
     total_eta = progress.eta_total()
 
+    effective_rate = progress._current_rate()
+
     part_text = f"{part_number}/{part_count}" if part_number and part_count else ""
     logging.info(
         f'FILE "{file_name}" {part_text} {file_pct:.2f}% '
         f"{file_remaining} left, {file_eta} ETA | "
-        f"JOB {total_pct:.2f}% {total_remaining} left, {total_eta} ETA"
+        f"JOB {total_pct:.2f}% {total_remaining} left, {total_eta} ETA | "
+        f"Rate: {effective_rate / (ONE_M):.2f} MiB/s"
     )
 
 
@@ -444,15 +451,15 @@ def collect_files(
     Return all files under *root* that match *include_pat* and
     do **not** match any pattern in *exclude_pats*.
     """
-    iterator = root.rglob("*") if recursive else root.glob("*")
+    iterator = (
+        root.rglob(include_pat or "*") if recursive else root.glob(include_pat or "*")
+    )
     files: list[Path] = []
 
     for path in iterator:
         if not path.is_file():
             continue
         rel = path.relative_to(root).as_posix()
-        if include_pat and not fnmatch.fnmatch(rel, include_pat):
-            continue
         if any(fnmatch.fnmatch(rel, pat) for pat in exclude_pats):
             continue
         files.append(path)
@@ -478,8 +485,12 @@ def prepare_job(
         file_name = str(file_path.relative_to(directory).as_posix())
         init_file_entry(status, file_name, file_path.stat().st_size)
 
+    # Include only files matching the specifier, even if
+    # there are other unfinished files in the status file
     pending_files = sorted(
-        directory / key for key, meta in status.items() if meta["status"] != "completed"
+        directory / key
+        for key, meta in status.items()
+        if meta["status"] != "completed" and key in [f.name for f in all_files]
     )
     return pending_files, status
 
@@ -578,7 +589,7 @@ def main() -> None:
     configure_logging(args.log_level, args.dry_run)
 
     # Initialize S3 client
-    config = bc.Config(
+    config = botocore.config.Config(
         retries={
             "mode": "adaptive",  # adaptive == exponential back‑off + client‑side rate limiting
             "max_attempts": 10,  # bump from AWS default (3 or 4)
@@ -703,6 +714,7 @@ class ThrottledReader:
             if not (0 < num_bytes_to_read < bytes_left):
                 num_bytes_to_read = bytes_left
 
+        #        logging.info(f"Reading {num_bytes_to_read} bytes")
         chunk = self.fp.read(num_bytes_to_read)
         chunk_len = len(chunk)
         if chunk_len == 0:
@@ -712,17 +724,36 @@ class ThrottledReader:
         elapsed = (datetime.now() - self.when_started).total_seconds()
         expected_duration = self.bytes_sent / RATE_LIMIT_BYTES_PER_SEC
         if expected_duration > elapsed:
-            time.sleep(expected_duration - elapsed)
+            sleep_time = expected_duration - elapsed
+            logging.info(f"Sleeping for {sleep_time:.2f} seconds to limit rate")
+            time.sleep(sleep_time)
 
         return chunk
 
+    # clamp so boto3 *thinks* the file is only `max_bytes` long
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        return self.fp.seek(offset, whence)
+        if whence == io.SEEK_END:
+            offset = self.max_bytes + offset
+        elif whence == io.SEEK_CUR:
+            offset = self.pos + offset
+        self.pos = max(0, min(offset, self.max_bytes))
+        self.fp.seek(self.start_offset + self.pos)
+        return self.pos
 
     def tell(self) -> int:
-        return self.fp.tell()
+        return self.pos
+
+    def __len__(self) -> int:  # extra hint for botocore
+        return self.max_bytes
+
+    def seekable(self) -> bool:
+        return True
 
 
 if __name__ == "__main__":
-    # Run the main function
-    main()
+    try:
+        # Run the main function
+        main()
+    except KeyboardInterrupt:
+        logging.warning("Interrupted by Ctrl-C")
+        sys.exit(130)  # 130 is the exit code for Ctrl-C
