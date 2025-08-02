@@ -117,6 +117,24 @@ def init_file_entry(status: StatusDict, file_name: str, size: int) -> None:
         }
 
 
+def bytes_already_uploaded(
+    pending_files: list[Path], status: StatusDict, root: Path
+) -> int:
+    """
+    Return the number of bytes already uploaded for the pending files.
+
+    Args:
+        pending_files: The list of pending files.
+        status: The status of the upload.
+        root: The root directory of the upload.
+    """
+    total = 0
+    for p in pending_files:
+        entry = status[str(p.relative_to(root).as_posix())]
+        total += entry.get("uploaded_bytes", 0)
+    return total
+
+
 def add_to_dict_if(dest: dict[str, str], key: str, value: str | None) -> None:
     """
     Add a key to a dictionary only if the value is truthy.
@@ -131,18 +149,14 @@ def add_to_dict_if(dest: dict[str, str], key: str, value: str | None) -> None:
 
 
 class ProgressTracker:
-    """
-    Track the progress of the upload.
-    """
+    def __init__(self, total_bytes: int, initial_uploaded: int = 0) -> None:
+        self.total_bytes = total_bytes
+        self.uploaded_bytes = initial_uploaded
+        self.start_time = datetime.now()
 
-    def __init__(self, total_bytes: int) -> None:
-        self.total_bytes: int = total_bytes
-        self.start_time: datetime = datetime.now()
-        self.uploaded_bytes: int = 0
-
-        # (timestamp, uploaded_bytes) samples for rolling‑window rate
         self._history: deque[tuple[datetime, int]] = deque()
-        self._history.append((self.start_time, 0))
+        # seed history so the first rate calculation is sane
+        self._history.append((self.start_time, self.uploaded_bytes))
 
     # ----------------------------- internals ------------------------------
 
@@ -511,12 +525,6 @@ def summarize_plan(
     total_bytes = sum(
         status[str(f.relative_to(directory).as_posix())]["size"] for f in pending_files
     )
-
-    # Subtract the size of the already uploaded parts of pending files
-    for file in pending_files:
-        file_status = status[str(file.relative_to(directory).as_posix())]
-        total_bytes -= file_status["uploaded_bytes"]
-
     return len(pending_files), total_bytes
 
 
@@ -653,7 +661,8 @@ def main() -> None:
     )
 
     # Initialize progress tracker
-    progress = ProgressTracker(pending_bytes)
+    already_done = bytes_already_uploaded(pending_files, status, root_dir)
+    progress = ProgressTracker(pending_bytes, initial_uploaded=already_done)
 
     # Upload files
     for local_path in pending_files:
