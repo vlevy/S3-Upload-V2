@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import io
 import logging
 import math
 import sys
@@ -23,7 +24,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import boto3
 import botocore.config as bc
@@ -35,6 +36,7 @@ args: argparse.Namespace
 MULTIPART_PART_SIZE: int = 250 * 1024 * 1024  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
+RATE_LIMIT_BYTES_PER_SEC = 100000000 * 1024 * 1024  # 100 MiB/s
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -95,17 +97,17 @@ def save_status_file(status: StatusDict, path: Path) -> None:
         yaml.safe_dump(status, f, sort_keys=False)
 
 
-def init_file_entry(status: StatusDict, key: str, size: int) -> None:
+def init_file_entry(status: StatusDict, file_name: str, size: int) -> None:
     """
     Initialize the status of a file.
 
     Args:
         status: The status of the upload.
-        key: The key of the file.
+        file_name: The key of the file.
         size: The size of the file.
     """
-    if key not in status:
-        status[key] = {
+    if file_name not in status:
+        status[file_name] = {
             "size": size,
             "uploaded_bytes": 0,
             "status": "pending",
@@ -208,7 +210,7 @@ class ProgressTracker:
 def upload_small_file(
     s3_client: botocore.client.BaseClient,
     bucket: str,
-    key: str,
+    file_name: str,
     path: Path,
     status: StatusDict,
     progress: ProgressTracker,
@@ -227,9 +229,9 @@ def upload_small_file(
 
     if dry_run:
         # simulate network latency: none, but walk the same state changes
-        logging.debug(f"DRY-RUN simulate small upload for {key}")
+        logging.debug(f"DRY-RUN simulate small upload for {file_name}")
     else:
-        logging.debug(f"Uploading small file {key}")
+        logging.debug(f"Uploading small file {file_name}")
         extra = {
             "ACL": "private",
             "StorageClass": args.storage_class,
@@ -239,15 +241,15 @@ def upload_small_file(
         s3_client.upload_file(
             Filename=str(path),
             Bucket=bucket,
-            Key=key,
+            Key=file_name,
             ExtraArgs=extra,
         )
-    status[key]["status"] = "completed"
-    status[key]["uploaded_bytes"] = size
+    status[file_name]["status"] = "completed"
+    status[file_name]["uploaded_bytes"] = size
     progress.update(size)
     save_status_file(status, status_file)
 
-    log_file_progress(key, size, size, progress)
+    log_file_progress(file_name, size, size, progress)
 
 
 def upload_large_file(
@@ -261,21 +263,16 @@ def upload_large_file(
     status_file: Path,
 ) -> None:
     """
-    Upload a large file to S3.
-
-    Args:
-        s3_client: The S3 client.
-        bucket: The bucket to upload the file to.
-        file_name: The key of the file.
+    Upload a large file to S3, streaming each part through a ThrottledReader
+    that smooths bandwidth without changing the 250 MiB part granularity.
     """
-
     entry = status[file_name]
     size = entry["size"]
     part_count = math.ceil(size / MULTIPART_PART_SIZE)
-    uploaded_parts: dict[int, str] = entry.get("parts", {})
-    file_uploaded = entry.get("uploaded_bytes", 0)  # running byte counter
+    uploaded_parts = entry.get("parts", {})
+    file_uploaded = entry.get("uploaded_bytes", 0)
 
-    # Create or reuse an upload ID
+    # Create or reuse multipart upload
     if entry.get("upload_id") is None:
         if dry_run:
             upload_id = f"dry-run-{int(datetime.now().timestamp())}"
@@ -288,7 +285,6 @@ def upload_large_file(
                 "StorageClass": args.storage_class,
             }
             add_to_dict_if(create_kwargs, "ChecksumAlgorithm", CHECKSUM_ALGO)
-
             upload_id = s3_client.create_multipart_upload(**create_kwargs)["UploadId"]
         entry["upload_id"] = upload_id
         entry["parts"] = {}
@@ -296,41 +292,40 @@ def upload_large_file(
 
     upload_id = entry["upload_id"]
 
-    # Loop over every missing part
     for part_number in range(1, part_count + 1):
         if part_number in uploaded_parts:
             continue
 
         offset = (part_number - 1) * MULTIPART_PART_SIZE
-        bytes_left = size - offset
-        part_size = min(MULTIPART_PART_SIZE, bytes_left)
+        part_size = min(MULTIPART_PART_SIZE, size - offset)
 
         if dry_run:
-            time.sleep(0.1)  # simulate negligible latency
+            time.sleep(0.1)
             etag = f"dry-run-etag-{part_number}"
         else:
             logging.debug(f"Uploading part {part_number}/{part_count} for {file_name}")
             with path.open("rb") as f:
                 f.seek(offset)
-                data = f.read(part_size)
-            part_kwargs = {
-                "Bucket": bucket,
-                "Key": file_name,
-                "PartNumber": part_number,
-                "UploadId": upload_id,
-                "Body": data,
-            }
-            add_to_dict_if(part_kwargs, "ChecksumAlgorithm", CHECKSUM_ALGO)
+                # buffer in 4 MiB windows so ThrottledReader can sleep frequently
+                buffered = io.BufferedReader(f, buffer_size=4 * 1024 * 1024)
+                # enforce both rate and max-bytes for this part
+                reader = ThrottledReader(
+                    buffered,
+                    max_bytes=part_size,
+                )
+                resp = s3_client.upload_part(
+                    Bucket=bucket,
+                    Key=file_name,
+                    PartNumber=part_number,
+                    UploadId=upload_id,
+                    Body=reader,
+                    **({"ChecksumAlgorithm": CHECKSUM_ALGO} if CHECKSUM_ALGO else {}),
+                )
+                etag = resp["ETag"]
 
-            resp = s3_client.upload_part(**part_kwargs)
-            etag = resp["ETag"]
-
-        # record completed part
         entry["parts"][part_number] = etag
-
-        file_uploaded += part_size  # advance running total
+        file_uploaded += part_size
         entry["uploaded_bytes"] = file_uploaded
-
         save_status_file(status, status_file)
 
         progress.update(part_size)
@@ -343,14 +338,12 @@ def upload_large_file(
             part_count,
         )
 
-    # Complete multipart upload
     if dry_run:
         logging.debug(f"Complete multipart upload for {file_name}")
     else:
         part_info = {
             "Parts": [
-                {"PartNumber": n, "ETag": etag}
-                for n, etag in sorted(entry["parts"].items())
+                {"PartNumber": n, "ETag": e} for n, e in sorted(entry["parts"].items())
             ]
         }
         complete_kwargs = {
@@ -482,8 +475,8 @@ def prepare_job(
 
     status = load_status_file(status_path)
     for file_path in all_files:
-        rel_key = str(file_path.relative_to(directory).as_posix())
-        init_file_entry(status, rel_key, file_path.stat().st_size)
+        file_name = str(file_path.relative_to(directory).as_posix())
+        init_file_entry(status, file_name, file_path.stat().st_size)
 
     pending_files = sorted(
         directory / key for key, meta in status.items() if meta["status"] != "completed"
@@ -688,6 +681,46 @@ def main() -> None:
         logging.info("All uploads completed successfully")
     else:
         logging.info("Completed, status file reflects simulated uploads")
+
+
+class ThrottledReader:
+    """
+    Wrap a file-like object and enforce a max read rate (bytes/sec),
+    optionally limiting total bytes read.
+    """
+
+    def __init__(self, fp: IO[bytes], max_bytes: int | None = None) -> None:
+        self.fp = fp
+        self.max_bytes = max_bytes
+        self.when_started = datetime.now()
+        self.bytes_sent = 0
+
+    def read(self, num_bytes_to_read: int = -1) -> bytes:
+        if self.max_bytes is not None:
+            bytes_left = self.max_bytes - self.bytes_sent
+            if bytes_left <= 0:
+                return b""
+            if not (0 < num_bytes_to_read < bytes_left):
+                num_bytes_to_read = bytes_left
+
+        chunk = self.fp.read(num_bytes_to_read)
+        chunk_len = len(chunk)
+        if chunk_len == 0:
+            return chunk
+
+        self.bytes_sent += chunk_len
+        elapsed = (datetime.now() - self.when_started).total_seconds()
+        expected_duration = self.bytes_sent / RATE_LIMIT_BYTES_PER_SEC
+        if expected_duration > elapsed:
+            time.sleep(expected_duration - elapsed)
+
+        return chunk
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        return self.fp.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self.fp.tell()
 
 
 if __name__ == "__main__":
