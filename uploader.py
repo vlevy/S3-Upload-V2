@@ -59,7 +59,7 @@ StatusDict = dict[str, Any]
 
 def configure_logging(level: str = "DEBUG", dry_run: bool = False) -> None:
     # If in dry-run mode, prefix all messages with "DRY-RUN"
-    log_format = "%(asctime)s.%(msecs)03d | %(levelname)s | %(lineno)d | %(funcName)s | %(message)s"
+    log_format = "%(asctime)s.%(msecs)03d | %(levelname)s | %(funcName)s | %(lineno)d | %(message)s"
     if dry_run:
         log_format = f"DRY-RUN | {log_format}"
 
@@ -696,58 +696,72 @@ def main() -> None:
 
 class ThrottledReader:
     """
-    Wrap a file-like object and enforce a max read rate (bytes/sec),
-    optionally limiting total bytes read.
+    Wrap a file-like object, enforce a max read rate, and remain fully seekable
+    so botocore can rewind the stream on retries.
     """
 
     def __init__(self, fp: IO[bytes], max_bytes: int | None = None) -> None:
         self.fp = fp
+        self.start_offset = fp.tell()  # baseline for seeks
         self.max_bytes = max_bytes
-        self.when_started = datetime.now()
+        self.pos = 0  # relative position inside this window
+
         self.bytes_sent = 0
+        self.when_started = time.perf_counter()
 
-    def read(self, num_bytes_to_read: int = -1) -> bytes:
+    # ------------------------------------------------------------------ reading
+
+    def read(self, size: int = -1) -> bytes:
         if self.max_bytes is not None:
-            bytes_left = self.max_bytes - self.bytes_sent
-            if bytes_left <= 0:
-                return b""
-            if not (0 < num_bytes_to_read < bytes_left):
-                num_bytes_to_read = bytes_left
+            size = min(size if size > 0 else self.max_bytes, self.max_bytes - self.pos)
 
-        #        logging.info(f"Reading {num_bytes_to_read} bytes")
-        chunk = self.fp.read(num_bytes_to_read)
+        chunk = self.fp.read(size)
         chunk_len = len(chunk)
         if chunk_len == 0:
             return chunk
 
+        self.pos += chunk_len
         self.bytes_sent += chunk_len
-        elapsed = (datetime.now() - self.when_started).total_seconds()
-        expected_duration = self.bytes_sent / RATE_LIMIT_BYTES_PER_SEC
-        if expected_duration > elapsed:
-            sleep_time = expected_duration - elapsed
-            logging.info(f"Sleeping for {sleep_time:.2f} seconds to limit rate")
-            time.sleep(sleep_time)
 
+        elapsed = time.perf_counter() - self.when_started
+        expected = self.bytes_sent / RATE_LIMIT_BYTES_PER_SEC
+        if expected > elapsed:
+            time.sleep(expected - elapsed)
         return chunk
 
-    # clamp so boto3 *thinks* the file is only `max_bytes` long
+    # ------------------------------------------------------------------ seeking
+
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        if whence == io.SEEK_END:
-            offset = self.max_bytes + offset
+        if whence == io.SEEK_SET:
+            new_pos = offset
         elif whence == io.SEEK_CUR:
-            offset = self.pos + offset
-        self.pos = max(0, min(offset, self.max_bytes))
-        self.fp.seek(self.start_offset + self.pos)
+            new_pos = self.pos + offset
+        elif whence == io.SEEK_END:
+            if self.max_bytes is None:
+                raise OSError("SEEK_END not supported without max_bytes")
+            new_pos = self.max_bytes + offset
+        else:
+            raise ValueError("invalid whence")
+
+        if new_pos < 0:
+            raise OSError("negative seek")
+        if self.max_bytes is not None:
+            new_pos = min(new_pos, self.max_bytes)
+
+        self.fp.seek(self.start_offset + new_pos, io.SEEK_SET)
+        self.pos = new_pos
+        self.bytes_sent = new_pos  # keep rate math consistent
+        self.when_started = time.perf_counter()
         return self.pos
 
     def tell(self) -> int:
         return self.pos
 
-    def __len__(self) -> int:  # extra hint for botocore
-        return self.max_bytes
-
     def seekable(self) -> bool:
         return True
+
+    def __len__(self) -> int:  # hint for botocore
+        return self.max_bytes if self.max_bytes is not None else 0
 
 
 if __name__ == "__main__":
