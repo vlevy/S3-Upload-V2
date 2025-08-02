@@ -39,7 +39,7 @@ ONE_G = ONE_M * ONE_K
 MULTIPART_PART_SIZE: int = 250 * ONE_M  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
-RATE_LIMIT_BYTES_PER_SEC = 100 * ONE_G
+RATE_LIMIT_BYTES_PER_SEC = 50 * ONE_M
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -59,7 +59,7 @@ StatusDict = dict[str, Any]
 
 def configure_logging(level: str = "DEBUG", dry_run: bool = False) -> None:
     # If in dry-run mode, prefix all messages with "DRY-RUN"
-    log_format = "%(asctime)s.%(msecs)03d | %(levelname)s | %(funcName)s | %(lineno)d | %(message)s"
+    log_format = "%(asctime)s.%(msecs)03d | %(levelname)s | %(funcName)s | %(lineno)4d | %(message)s"
     if dry_run:
         log_format = f"DRY-RUN | {log_format}"
 
@@ -73,6 +73,33 @@ def configure_logging(level: str = "DEBUG", dry_run: bool = False) -> None:
 # ------------------------------------------------------------------------------
 # YAML status helpers
 # ------------------------------------------------------------------------------
+
+
+def show_status(status_file_path: Path) -> None:
+    """
+    Print the status of the upload to the console.
+
+    Args:
+        status_file_path: The path to the status file.
+    """
+    logging.info(f"Showing status for {status_file_path}")
+    status = load_status_file(status_file_path)
+    if not status:
+        logging.info("No status file found or file is empty")
+        return
+
+    # header
+    print(f"{'File':<50} {'Size (GiB)':>11} {'Status':>11} {'Done (GiB)':>11} %{'':>5}")
+
+    for key, meta in sorted(status.items()):
+        size = meta.get("size", 0)
+        uploaded = meta.get("uploaded_bytes", 0)
+        status = meta.get("status", "pending")
+        pct = (uploaded / size * 100) if size else 0.0
+        print(
+            f"{key:<50} {size / ONE_G:11.1f} {status:>11} {uploaded / ONE_G:11.1f} {pct:6.2f}"
+        )
+    return
 
 
 def load_status_file(path: Path) -> StatusDict:
@@ -539,8 +566,8 @@ def main() -> None:
     """
     global args
     parser = argparse.ArgumentParser(description="Upload a directory tree to S3")
-    parser.add_argument("--bucket", required=True, help="Destination S3 bucket name")
-    parser.add_argument("--directory", required=True, help="Local directory to upload")
+    parser.add_argument("--bucket", required=False, help="Destination S3 bucket name")
+    parser.add_argument("--directory", required=False, help="Local directory to upload")
     parser.add_argument(
         "--log-level",
         default="DEBUG" if "--dry-run" in sys.argv else "INFO",
@@ -591,10 +618,43 @@ def main() -> None:
         action="store_true",
         help="Show the final list of files to upload, then continue",
     )
+    parser.add_argument(
+        "-S",
+        "--show-status",
+        action="store_true",
+        help="List the current status of each tracked file and exit",
+    )
 
     # Parse arguments
     args = parser.parse_args()
     configure_logging(args.log_level, args.dry_run)
+
+    # Argument sanity checks
+    if not (args.show_status or args.cleanup) and not args.bucket:
+        logging.error("Bucket is required")
+        return
+    if not args.cleanup and not args.directory:
+        logging.error("Directory is required")
+        return
+
+    # Initialize the status file paths
+    # Get root directory and create the status file path
+    root_dir = Path(args.directory).expanduser().resolve()
+    if not root_dir.is_dir():
+        logging.error(
+            f"Specified directory {root_dir} does not exist or is not a directory"
+        )
+        sys.exit(1)
+
+    status_file_name: str = (
+        "upload_status.yaml" if not args.dry_run else "upload_status_dry_run.yaml"
+    )
+
+    status_file_path = (root_dir / status_file_name).resolve()
+    if args.show_status:
+        # Show the status of the upload
+        show_status(status_file_path)
+        return
 
     # Initialize S3 client
     config = botocore.config.Config(
@@ -607,19 +667,6 @@ def main() -> None:
     )
 
     s3_client = boto3.client("s3", config=config)
-
-    # Get root directory and create the status file path
-    root_dir = Path(args.directory).expanduser().resolve()
-    if not root_dir.is_dir():
-        logging.error(
-            f"Specified directory {root_dir} does not exist or is not a directory"
-        )
-        sys.exit(1)
-
-    status_file_name: str = (
-        "upload_status.yaml" if not args.dry_run else "upload_status_dry_run.yaml"
-    )
-    status_file_path = (root_dir / status_file_name).resolve()
 
     # Prepare the job
     pending_files, status = prepare_job(

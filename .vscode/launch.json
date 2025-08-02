@@ -57,6 +57,19 @@
             ],
             "console": "integratedTerminal",
             "justMyCode": true
+        },
+        {
+            "name": "Show status",
+            "type": "python",
+            "request": "launch",
+            "module": "uploader",
+            "args": [
+                "--show-status",
+                "--directory",
+                "U:/Vic"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
         }
     ]
 }
