@@ -4,7 +4,7 @@
     "configurations": [
         {
             "name": "Real upload to S3",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "module": "uploader",
             "args": [
@@ -25,7 +25,7 @@
         },
         {
             "name": "Dry-run upload to S3",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "module": "uploader",
             "args": [
@@ -44,8 +44,24 @@
             "justMyCode": true
         },
         {
-            "name": "Cleanup multipart uploads",
-            "type": "python",
+            "name": "Dry-run cleanup multipart uploads",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "uploader",
+            "args": [
+                "--bucket",
+                "file-backups-raichu",
+                "--directory",
+                "U:/Vic",
+                "--cleanup",
+                "--dry-run"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Real cleanup multipart uploads",
+            "type": "debugpy",
             "request": "launch",
             "module": "uploader",
             "args": [
@@ -60,7 +76,7 @@
         },
         {
             "name": "Show status",
-            "type": "python",
+            "type": "debugpy",
             "request": "launch",
             "module": "uploader",
             "args": [

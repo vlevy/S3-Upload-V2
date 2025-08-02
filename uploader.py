@@ -463,7 +463,11 @@ def cleanup_multipart_uploads(
             upload_id = upload["UploadId"]
             if key not in local_keys:
                 logging.info(f"Aborting stale upload {key} (UploadId {upload_id})")
-                if not dry_run:
+                if dry_run:
+                    logging.info(
+                        f"DRY-RUN aborting stale upload {key} (UploadId {upload_id})"
+                    )
+                else:
                     s3_client.abort_multipart_upload(
                         Bucket=bucket,
                         Key=key,
