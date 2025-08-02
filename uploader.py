@@ -657,7 +657,7 @@ def main() -> None:
 
     logging.info(
         f"Starting upload, {pending_count} pending files, "
-        f"{pending_bytes / 1024 / 1024 / 1024:.2f} GiB total"
+        f"{pending_bytes / ONE_G:.2f} GiB total"
     )
 
     # Initialize progress tracker
