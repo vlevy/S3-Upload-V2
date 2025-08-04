@@ -39,7 +39,7 @@ ONE_G = ONE_M * ONE_K
 MULTIPART_PART_SIZE: int = 250 * ONE_M  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
-RATE_LIMIT_BYTES_PER_SEC = 50 * ONE_M
+DEFAULT_RATE_LIMIT_BYTES_PER_SEC = 5 * ONE_M
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -305,6 +305,7 @@ def upload_large_file(
     progress: ProgressTracker,
     dry_run: bool,
     status_file: Path,
+    rate_limit_bytes_per_sec: int,
 ) -> None:
     """
     Upload a large file to S3, streaming each part through a ThrottledReader
@@ -356,6 +357,7 @@ def upload_large_file(
                 reader = ThrottledReader(
                     buffered,
                     max_bytes=part_size,
+                    rate_limit_bytes_per_sec=rate_limit_bytes_per_sec,
                 )
                 resp = s3_client.upload_part(
                     Bucket=bucket,
@@ -628,12 +630,33 @@ def main() -> None:
         action="store_true",
         help="List the current status of each tracked file and exit",
     )
-
+    parser.add_argument(
+        "-L",
+        "--limit",
+        type=float,
+        metavar="MiB",
+        help="Bandwidth limit in MiB/s (default: %(default)s)",
+    )
     # Parse arguments
     args = parser.parse_args()
     configure_logging(args.log_level, args.dry_run)
 
-    # Argument sanity checks
+    # Handle the ‑L/‑‑limit value (MiB/s) argument
+    if args.limit is None:
+        # User did not pass -L/--limit
+        rate_limit_bps = DEFAULT_RATE_LIMIT_BYTES_PER_SEC
+        logging.warning(
+            "No bandwidth limit specified, using default (pass -L/--limit to override)",
+        )
+    else:
+        # User supplied a value
+        if args.limit <= 0:
+            logging.error("Bandwidth limit must be positive")
+            sys.exit(2)
+        rate_limit_bps = int(args.limit * ONE_M)
+    logging.info(f"Bandwidth limit: {rate_limit_bps / ONE_M} MiB/s")
+
+    # Other argument sanity checks
     if not (args.show_status or args.cleanup) and not args.bucket:
         logging.error("Bucket is required")
         return
@@ -742,6 +765,7 @@ def main() -> None:
                     progress,
                     args.dry_run,
                     status_file_path,
+                    rate_limit_bytes_per_sec=rate_limit_bps,
                 )
         except Exception:  # noqa: BLE001
             logging.exception(f"Upload failed for {file_name}, will retry on next run")
@@ -760,11 +784,17 @@ class ThrottledReader:
     so botocore can rewind the stream on retries.
     """
 
-    def __init__(self, fp: IO[bytes], max_bytes: int | None = None) -> None:
+    def __init__(
+        self,
+        fp: IO[bytes],
+        max_bytes: int,
+        rate_limit_bytes_per_sec: int,
+    ) -> None:
         self.fp = fp
         self.start_offset = fp.tell()  # baseline for seeks
         self.max_bytes = max_bytes
         self.pos = 0  # relative position inside this window
+        self.rate_limit_bytes_per_sec = rate_limit_bytes_per_sec
 
         self.bytes_sent = 0
         self.when_started = time.perf_counter()
@@ -784,7 +814,7 @@ class ThrottledReader:
         self.bytes_sent += chunk_len
 
         elapsed = time.perf_counter() - self.when_started
-        expected = self.bytes_sent / RATE_LIMIT_BYTES_PER_SEC
+        expected = self.bytes_sent / self.rate_limit_bytes_per_sec
         if expected > elapsed:
             time.sleep(expected - elapsed)
         return chunk
