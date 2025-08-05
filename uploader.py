@@ -19,10 +19,12 @@ import fnmatch
 import io
 import logging
 import math
+import re
 import sys
 import time
 from collections import deque
 from datetime import datetime, timedelta
+from datetime import time as _dtime
 from pathlib import Path
 from typing import IO, Any
 
@@ -40,6 +42,7 @@ MULTIPART_PART_SIZE: int = 250 * ONE_M  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
 DEFAULT_RATE_LIMIT_BYTES_PER_SEC = 5 * ONE_M
+UNLIMITED_RATE_BYTES_PER_SEC = 100 * ONE_M
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -251,6 +254,26 @@ class ProgressTracker:
 # ------------------------------------------------------------------------------
 
 
+def is_in_unlimited_span(unlimited_span: tuple[_dtime, _dtime] | None) -> bool:
+    """
+    Return True when *now* is inside the span [start, end),
+    correctly handling spans that cross midnight (end < start).
+    """
+    if not unlimited_span:
+        # There is no unlimited span, so we are not in it
+        return False
+
+    now = datetime.now().time()
+    start, end = unlimited_span
+
+    if start <= end:  # normal case, same day
+        in_span = start <= now < end
+    else:
+        in_span = now >= start or now < end  # crosses midnight
+
+    return in_span
+
+
 def upload_small_file(
     s3_client: botocore.client.BaseClient,
     bucket: str,
@@ -293,7 +316,7 @@ def upload_small_file(
     progress.update(size)
     save_status_file(status, status_file)
 
-    log_file_progress(file_name, size, size, progress)
+    log_file_progress(file_name, size, size, progress, None, None, False)
 
 
 def upload_large_file(
@@ -306,6 +329,7 @@ def upload_large_file(
     dry_run: bool,
     status_file: Path,
     rate_limit_bytes_per_sec: int,
+    unlimited_span: tuple[_dtime, _dtime] | None = None,
 ) -> None:
     """
     Upload a large file to S3, streaming each part through a ThrottledReader
@@ -343,12 +367,11 @@ def upload_large_file(
 
         offset = (part_number - 1) * MULTIPART_PART_SIZE
         part_size = min(MULTIPART_PART_SIZE, size - offset)
-
+        currently_in_unlimited_span = is_in_unlimited_span(unlimited_span)
         if dry_run:
             time.sleep(0.1)
             etag = f"dry-run-etag-{part_number}"
         else:
-            logging.debug(f"Uploading part {part_number}/{part_count} for {file_name}")
             with path.open("rb") as f:
                 f.seek(offset)
                 # buffer in 4 MiB windows so ThrottledReader can sleep frequently
@@ -358,6 +381,7 @@ def upload_large_file(
                     buffered,
                     max_bytes=part_size,
                     rate_limit_bytes_per_sec=rate_limit_bytes_per_sec,
+                    in_unlimited_span=currently_in_unlimited_span,
                 )
                 resp = s3_client.upload_part(
                     Bucket=bucket,
@@ -383,6 +407,7 @@ def upload_large_file(
             progress,
             part_number,
             part_count,
+            currently_in_unlimited_span,
         )
 
     if dry_run:
@@ -411,8 +436,9 @@ def log_file_progress(
     file_uploaded: int,
     file_size: int,
     progress: ProgressTracker,
-    part_number: int | None = None,
-    part_count: int | None = None,
+    part_number: int | None,
+    part_count: int | None,
+    currently_in_unlimited_span: bool,
 ) -> None:
     """
     Log the progress of the upload, including effective bytes per second.
@@ -433,6 +459,7 @@ def log_file_progress(
         f"{file_remaining} left, {file_eta} ETA | "
         f"JOB {total_pct:.2f}% {total_remaining} left, {total_eta} ETA | "
         f"Rate: {effective_rate / (ONE_M):.2f} MiB/s"
+        + (" +" if currently_in_unlimited_span else " -")
     )
 
 
@@ -637,6 +664,14 @@ def main() -> None:
         metavar="MiB",
         help="Bandwidth limit in MiB/s (default: %(default)s)",
     )
+    parser.add_argument(
+        "-U",
+        "--unlimited-span",
+        metavar="HH:MM-HH:MM",
+        help="Disable throttling during this time window, "
+        "e.g., 07:00-22:45 or 22:45-07:00",
+    )
+
     # Parse arguments
     args = parser.parse_args()
     configure_logging(args.log_level, args.dry_run)
@@ -655,6 +690,20 @@ def main() -> None:
             sys.exit(2)
         rate_limit_bps = int(args.limit * ONE_M)
     logging.info(f"Bandwidth limit: {rate_limit_bps / ONE_M} MiB/s")
+
+    # Parse (optional) unlimited‑span
+    unlimited_span: tuple[_dtime, _dtime] | None = None
+    if args.unlimited_span:
+        try:
+            unlimited_span = _parse_time_span(args.unlimited_span)
+            logging.info(
+                "Unlimited bandwidth between %s and %s",
+                args.unlimited_span.split("-")[0],
+                args.unlimited_span.split("-")[1],
+            )
+        except ValueError as exc:
+            logging.error("%s", exc)
+            sys.exit(2)
 
     # Other argument sanity checks
     if not (args.show_status or args.cleanup) and not args.bucket:
@@ -766,6 +815,7 @@ def main() -> None:
                     args.dry_run,
                     status_file_path,
                     rate_limit_bytes_per_sec=rate_limit_bps,
+                    unlimited_span=unlimited_span,
                 )
         except Exception:  # noqa: BLE001
             logging.exception(f"Upload failed for {file_name}, will retry on next run")
@@ -780,7 +830,7 @@ def main() -> None:
 
 class ThrottledReader:
     """
-    Wrap a file-like object, enforce a max read rate, and remain fully seekable
+    Wrap a file‑like object, enforce a max read rate, and remain fully seekable
     so botocore can rewind the stream on retries.
     """
 
@@ -789,15 +839,17 @@ class ThrottledReader:
         fp: IO[bytes],
         max_bytes: int,
         rate_limit_bytes_per_sec: int,
+        in_unlimited_span: bool,
     ) -> None:
         self.fp = fp
-        self.start_offset = fp.tell()  # baseline for seeks
+        self.start_offset = fp.tell()
         self.max_bytes = max_bytes
-        self.pos = 0  # relative position inside this window
-        self.rate_limit_bytes_per_sec = rate_limit_bytes_per_sec
+        self.pos = 0
 
+        self.rate_limit_bytes_per_sec = rate_limit_bytes_per_sec
         self.bytes_sent = 0
         self.when_started = time.perf_counter()
+        self.in_unlimited_span: bool = in_unlimited_span
 
     # ------------------------------------------------------------------ reading
 
@@ -811,8 +863,14 @@ class ThrottledReader:
             return chunk
 
         self.pos += chunk_len
-        self.bytes_sent += chunk_len
 
+        # ---------------------------------------------------------- throttle?
+        if self.in_unlimited_span:
+            # Inside unlimited window, no throttling
+            return chunk
+
+        # Normal throttling path
+        self.bytes_sent += chunk_len
         elapsed = time.perf_counter() - self.when_started
         expected = self.bytes_sent / self.rate_limit_bytes_per_sec
         if expected > elapsed:
@@ -852,6 +910,23 @@ class ThrottledReader:
 
     def __len__(self) -> int:  # hint for botocore
         return self.max_bytes if self.max_bytes is not None else 0
+
+
+_SPAN_RE = re.compile(r"^(\d{2}):(\d{2})-(\d{2}):(\d{2})$")
+
+
+def _parse_time_span(spec: str) -> tuple[_dtime, _dtime]:
+    """
+    Validate and convert 'HH:MM-HH:MM' into two datetime.time objects.
+    Raises ValueError on bad input.
+    """
+    m = _SPAN_RE.match(spec)
+    if not m:
+        raise ValueError("Time span must be HH:MM-HH:MM (24 h clock)")
+    h1, m1, h2, m2 = map(int, m.groups())
+    if not all(0 <= h < 24 for h in (h1, h2)) or not all(0 <= m < 60 for m in (m1, m2)):
+        raise ValueError("Hour must be 00‑23 and minute 00‑59")
+    return _dtime(hour=h1, minute=m1), _dtime(hour=h2, minute=m2)
 
 
 if __name__ == "__main__":

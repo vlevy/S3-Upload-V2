@@ -11,14 +11,18 @@
                 "--bucket",
                 "file-backups-raichu",
                 "--directory",
-                "U:/Vic",
+                "V:/",
                 "--include",
-                "Files 23 2025-05",
+                "Files*",
                 "--exclude",
                 "*FROM AWS",
                 "--list-files",
                 "--storage-class",
-                "STANDARD_IA"
+                "STANDARD_IA",
+                "--limit",
+                "4",
+                "--unlimited-span",
+                "21:10-21:15"
             ],
             "console": "integratedTerminal",
             "justMyCode": true
