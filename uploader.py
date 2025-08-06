@@ -41,8 +41,9 @@ ONE_G = ONE_M * ONE_K
 MULTIPART_PART_SIZE: int = 250 * ONE_M  # 250 MiB
 SINGLE_PART_THRESHOLD: int = MULTIPART_PART_SIZE
 RATE_CALCULATION_WINDOW_MINUTES: int = 5  # minutes of history for rate calc
-DEFAULT_RATE_LIMIT_BYTES_PER_SEC = 5 * ONE_M
+DEFAULT_RATE_LIMIT_BYTES_PER_SEC = 8 * ONE_M
 UNLIMITED_RATE_BYTES_PER_SEC = 100 * ONE_M
+MIN_CHUNK_SLEEP_TIME_SECONDS = 0.05
 
 # Checksum algorithm requested from Amazon S3
 # CHECKSUM_ALGO picks the algorithm or disables integrity
@@ -780,7 +781,7 @@ def main() -> None:
 
     logging.info(
         f"Starting upload, {pending_count} pending files, "
-        f"{pending_bytes / ONE_G:.2f} GiB total"
+        f"{pending_bytes / ONE_G:,.2f} GiB total"
     )
 
     # Initialize progress tracker
@@ -864,17 +865,20 @@ class ThrottledReader:
 
         self.pos += chunk_len
 
-        # ---------------------------------------------------------- throttle?
+        # Throttling
+        # We need to sleep for at least a short time, to avoid network
+        # problems for other users
         if self.in_unlimited_span:
-            # Inside unlimited window, no throttling
+            # Inside unlimited window, nominal throttling
+            time.sleep(MIN_CHUNK_SLEEP_TIME_SECONDS)
             return chunk
 
         # Normal throttling path
         self.bytes_sent += chunk_len
         elapsed = time.perf_counter() - self.when_started
         expected = self.bytes_sent / self.rate_limit_bytes_per_sec
-        if expected > elapsed:
-            time.sleep(expected - elapsed)
+        sleep_time = max(MIN_CHUNK_SLEEP_TIME_SECONDS, expected - elapsed)
+        time.sleep(sleep_time)
         return chunk
 
     # ------------------------------------------------------------------ seeking
